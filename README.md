@@ -1,20 +1,28 @@
 # NCAIR-DSA: Multi-Lingual Patient Intake Assistant
 
-Voice-powered intake tool for primary healthcare centers. Patient speaks
-symptoms in Yoruba, Igbo, or Hausa; the system transcribes it (NCAIR ASR),
-structures it into an English clinical note (N-ATLaS LLM), extracts and
-highlights clinical keywords, and stores traceable patient history in the database.
+Voice-powered intake tool for primary healthcare centers. Patient speaks symptoms 
+in Yoruba, Igbo, or Hausa; the system transcribes it (NCAIR ASR), then structures 
+it into a **full, complete English clinical note** (N-ATLaS LLM) that removes the 
+translation barrier entirely. Keywords are extracted as a supporting **quick-reference 
+sidebar** to help doctors scan key clinical points during review. All visits are 
+linked to patient IDs for traceable clinical history.
+
+## Main Goal
+Remove language barriers in healthcare by generating full structured English clinical 
+notes from patient speech in indigenous languages. Doctors see a complete, editable 
+clinical note — not a translation, but a proper structured clinical document.
 
 ## Pipeline
 1. **Capture** — patient records audio via Gradio (web/mobile friendly)
 2. **Transcribe** — NCAIR/N-ATLaS ASR model (per-language) converts speech to text
-3. **Structure** — N-ATLaS-LLM turns transcript into structured English note (JSON)
-4. **Extract Keywords** — pull out clinical entities (symptoms, severity, duration,
-   anatomical sites) from the raw transcript
-5. **Highlight & Review** — display structured note with keywords highlighted in
-   yellow so doctor can spot key details instantly
-6. **Patient Tracking** — save visit to patient's clinical history (linked by patient ID)
-   in the database for traceable history across multiple visits
+3. **Structure** — N-ATLaS-LLM generates full English clinical note (chief complaint, 
+   duration, severity, history) — THIS IS THE MAIN DELIVERABLE
+4. **Extract Keywords** — pull out clinical entities (symptoms, severity, duration, 
+   anatomical sites) from the raw transcript as supporting reference only
+5. **Review** — doctor reviews and edits the full clinical note; keywords appear 
+   in a read-only sidebar for quick scanning
+6. **Save** — edited note is saved to patient's clinical history (linked by patient ID) 
+   for complete traceable record across multiple visits
 
 ## Repo Structure
 ```
@@ -54,14 +62,17 @@ python app.py                 # launches Gradio web interface
   4-bit, or use a hosted HF Inference Endpoint via `NATLAS_ENDPOINT_URL`)
 
 ## Key Features
-- **Keyword Extraction**: automatically pulls symptoms, severity, duration, and
-  anatomical sites from patient speech
-- **Visual Highlighting**: keywords highlighted in yellow in the doctor review screen
-  for quick scanning
-- **Patient Tracking**: each patient has a unique ID; all visits linked to that ID
-  for complete traceable clinical history
-- **Database Export**: generated patient records are exportable (JSON) for doctor
-  to input into their own system
+- **Full Clinical Notes**: converts unstructured patient speech into complete, 
+  structured English clinical notes with chief complaint, duration, severity, 
+  and relevant history — removes the translation barrier entirely
+- **Editable Doctor Review**: doctor can edit any part of the generated note before 
+  saving; full control over what goes into the patient record
+- **Quick-Reference Keywords** (supporting): extracted clinical keywords appear as 
+  a non-editable sidebar for doctors to quickly scan key clinical points without 
+  re-reading the full note
+- **Patient Tracking**: each patient has a unique ID; all visits linked to that ID 
+  for complete traceable clinical history across multiple intake sessions
+- **Multi-Language Support**: Hausa, Igbo, Yoruba — pilot starting with Hausa
 
 ## Team Workflow
 - Work on feature branches, not `main` — open a PR to merge
@@ -69,14 +80,14 @@ python app.py                 # launches Gradio web interface
 - Never commit `.env`, audio files, or model weights (see `.gitignore`)
 
 ## Module Ownership
-| Module | Folder | Owner(s) |
-|---|---|---|
-| ASR integration | `asr/` | 3 people — one per language testing |
-| LLM structuring | `nlp/structure_note.py` | 2 people — prompt engineering + LLM connection |
-| Keyword extraction | `nlp/extract_keywords.py` | 1 person — expand keywords, tune highlighting |
-| Frontend/UI (Gradio) | `app.py` | 2 people — audio UI + patient ID form + review screen |
-| Patient history/DB | `templates/clinical_note.py`, `data/` | 1 person — patient tracking + visit history |
-| Docs/testing | `tests/`, `README.md` | 1 person — keep README updated, test pipeline |
+| Module | Folder | Owner(s) | Priority |
+|---|---|---|---|
+| **LLM Structuring (CORE)** | `nlp/structure_note.py` | 2-3 people | 🔴 HIGHEST — generates the main clinical note |
+| ASR integration | `asr/` | 2-3 people | 🔴 HIGH — speech input pipeline |
+| Frontend/UI (Gradio) | `app.py` | 2 people | 🟡 MEDIUM — user interface |
+| Patient History/DB | `templates/clinical_note.py`, `data/` | 1 person | 🟡 MEDIUM — persistence layer |
+| **Keyword Extraction (SUPPORTING)** | `nlp/extract_keywords.py` | 1 person | 🟢 LOW — enhances review, not core |
+| Docs/Testing | `tests/`, `README.md` | 1 person | 🟢 LOW — integration + documentation |
 
 ## Pilot Language
 Starting with Hausa — strongest current ASR/LLM performance among the
