@@ -55,7 +55,8 @@ pip install -r requirements.txt
 cp .env.example .env          # fill in your HF_TOKEN
 python app.py                 # launches Gradio web interface
 ```
-
+## Info
+Create your own branch from main and push commits only to your branch, Deborah will have to approve to merge when you put in a pull request for ease of access and proper coordination. 
 ## Models
 - ASR: `NCAIR1/Hausa-ASR`, `NCAIR1/Igbo-ASR`, `NCAIR1/Yoruba-ASR` (Hugging Face)
 - Structuring: `NCAIR1/N-ATLaS` (8B params — needs GPU with 8GB+ VRAM for
