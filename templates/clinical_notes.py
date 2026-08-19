@@ -75,4 +75,5 @@ def get_patient_history(patient_id):
     )
     visits = cursor.fetchall()
     conn.close()
+    
     return visits
