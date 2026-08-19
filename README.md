@@ -46,6 +46,7 @@ ncair-dsa/
 ```
 
 ## Setup
+LOCALLY
 ```bash
 git clone <repo-url>
 cd ncair-dsa
@@ -55,6 +56,57 @@ pip install -r requirements.txt
 cp .env.example .env          # fill in your HF_TOKEN
 python app.py                 # launches Gradio web interface
 ```
+```## 🚀 Running on Google Colab (Recommended for Low-Spec PCs)
+
+If your local computer does not have a powerful GPU or sufficient RAM to load the model locally, you can run this entire project completely in the cloud using Google Colab's free T4 GPU.
+
+### 1. Set Up Your Cloud GPU
+1. Open [Google Colab](https://google.com) and create a **New Notebook**.
+2. Go to the top menu: **Runtime** ➔ **Change runtime type**.
+3. Under **Hardware accelerator**, select **T4 GPU** and click **Save**.
+
+### 2. Add Your Hugging Face Token to Colab
+To securely use your Hugging Face credentials without exposing them in your code:
+1. Click the **Key icon** (Secrets) on the left sidebar of Google Colab.
+2. Click **Add new secret**.
+3. Set the **Name** to: `HF_TOKEN`
+4. Set the **Value** to: *Your actual Hugging Face Access Token (`hf_...`)*
+5. Switch on the toggle for **Notebook access**.
+
+### 3. Clone and Install Dependencies
+Paste and run the following block of code in your first Colab cell:
+
+```python
+# Clone the repository
+!git clone <YOUR-REPO-URL>
+
+# Move into the project directory
+%cd ncair-dsa
+
+# Install all required dependencies
+!pip install -r requirements.txt
+```
+
+### 4. Configure Environment & Launch
+Create a new code cell, paste the script below, and run it to launch the Gradio web interface via a cloud endpoint:
+
+```python
+import os
+from google.colab import userdata
+
+# Load your token safely from Colab Secrets
+os.environ["HF_TOKEN"] = userdata.get('HF_TOKEN')
+
+# Use Hugging Face's hosted cloud architecture for inference
+os.environ["NATLAS_ENDPOINT_URL"] = "https://huggingface.co"
+
+# Launch the interface with a public shareable URL
+!python app.py --share
+```
+
+### 5. Access the Interface
+Once the script finishes executing, look at the terminal output for a URL ending in **`.gradio.live`**. Click that public link to open and use your application in a new browser tab.
+
 ## Info
 Create your own branch from main and push commits only to your branch, Deborah will have to approve to merge when you put in a pull request for ease of access and proper coordination. 
 ## Models
