@@ -56,7 +56,7 @@ pip install -r requirements.txt
 cp .env.example .env          # fill in your HF_TOKEN
 python app.py                 # launches Gradio web interface
 ```
-```## 🚀 Running on Google Colab (Recommended for Low-Spec PCs)
+## 🚀 Running on Google Colab (Recommended for Low-Spec PCs)
 
 If your local computer does not have a powerful GPU or sufficient RAM to load the model locally, you can run this entire project completely in the cloud using Google Colab's free T4 GPU.
 
