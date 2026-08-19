@@ -221,4 +221,6 @@ with gr.Blocks(title="NCAIR-DSA: Patient Intake Assistant") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    # share=True gives a public https://xxxx.gradio.live link — needed since
+    # this runs on Colab's server, not your own machine. Link lasts ~72 hours.
+    demo.launch(share=True, debug=True)
