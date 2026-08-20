@@ -5,3 +5,10 @@ matplotlib
 seaborn
 ipywidgets
 joblib
+transformers
+torch
+librosa
+soundfile
+noisereduce
+pydub
+jiwer
