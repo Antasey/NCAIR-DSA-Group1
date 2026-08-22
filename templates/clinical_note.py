@@ -49,7 +49,7 @@ def init_db():
         )
     """)
     conn.commit()
-    print(f"Database ready at: {DB_PATH})
+    print(f"Database ready at: {DB_PATH}")
     conn.close()
 
 def save_patient_record(patient_id, chief_complaint, duration, severity, 
