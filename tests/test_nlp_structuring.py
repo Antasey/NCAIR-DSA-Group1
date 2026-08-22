@@ -244,5 +244,3 @@ As you build structure_note.py, verify:
 
 When all are checked, you're ready to hand off to the Frontend team!
 """
-
-
