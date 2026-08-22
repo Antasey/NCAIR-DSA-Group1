@@ -50,8 +50,17 @@ def process_patient_intake(patient_id, language, audio_file):
     else:
         status = "✓ Ready for review"
 
-    # --- Step 3: Extract keywords (supporting reference only) ---
-    keywords = extract_keywords(transcript)
+    # --- Step 3: Extract keywords from the ENGLISH structured note ---
+    # (not the raw transcript, which may be in Hausa/Igbo/Yoruba — the
+    # keyword list is English words, so it needs English text to match against.
+    # The doctor is reading English, so keywords must come from what they read.)
+    english_note_text = " ".join([
+        note.get("chief_complaint", ""),
+        note.get("duration", ""),
+        note.get("severity", ""),
+        note.get("history", ""),
+    ])
+    keywords = extract_keywords(english_note_text)
 
     keywords_text = f"""Symptoms Detected:
 {', '.join(keywords.get('symptoms', [])) if keywords.get('symptoms') else 'None'}
