@@ -5,13 +5,23 @@ for traceable clinical history.
 """
 import sqlite3
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 
-DB_PATH = Path(__file__).parent.parent / "data" / "notes.db"
+# Persist to Google Drive if it's mounted (survives across Colab sessions).
+# Falls back to local storage if Drive isn't mounted (data lost when the
+# Colab session ends — fine for quick testing, not for real demos).
+_DRIVE_PATH = Path("/content/drive/MyDrive/NCAIR-DSA/data/notes.db")
+
+if os.path.exists("/content/drive/MyDrive"):
+    DB_PATH = _DRIVE_PATH
+else:
+    DB_PATH = Path(__file__).parent.parent / "data" / "notes.db"
+
 
 def init_db():
-    DB_PATH.parent.mkdir(exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     
     # Patients table
@@ -38,8 +48,8 @@ def init_db():
             FOREIGN KEY(patient_id) REFERENCES patients(patient_id)
         )
     """)
-    
     conn.commit()
+    print(f"Database ready at: {DB_PATH})
     conn.close()
 
 def save_patient_record(patient_id, chief_complaint, duration, severity, 
