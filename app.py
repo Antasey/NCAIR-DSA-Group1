@@ -11,6 +11,13 @@ directly to what gets saved in the database — no re-parsing free text.
 """
 import gradio as gr
 import json
+# Mount Google Drive BEFORE importing clinical_note — that module checks
+# whether Drive is mounted to decide where the database lives.
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+except ImportError:
+    pass  # not running in Colab — falls back to local storage
 
 from asr.transcribe import transcribe_audio
 from nlp.structure_note import structure_note
