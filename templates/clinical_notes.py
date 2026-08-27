@@ -31,8 +31,6 @@ def init_db():
             duration TEXT,
             severity TEXT,
             history TEXT,
-            causes TEXT,
-            Effect TEXT,
             language TEXT,
             extracted_keywords TEXT,
             raw_transcript TEXT,
@@ -55,10 +53,10 @@ def save_patient_record(patient_id, chief_complaint, duration, severity,
     # Save visit
     conn.execute(
         """INSERT INTO clinical_visits 
-           (patient_id, chief_complaint, duration, severity, history,causes, effect, language, 
+           (patient_id, chief_complaint, duration, severity, history,language, 
             extracted_keywords, raw_transcript)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (patient_id, chief_complaint, duration, severity, history,causes, effect, language,
+        (patient_id, chief_complaint, duration, severity, history,language,
          json.dumps(keywords), transcript)
     )
     conn.commit()
@@ -68,7 +66,7 @@ def get_patient_history(patient_id):
     """Retrieve full clinical history for a patient."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
-        """SELECT visit_id, chief_complaint, duration, severity, history,causes, effect,
+        """SELECT visit_id, chief_complaint, duration, severity, history,
                   language, created_at
            FROM clinical_visits
            WHERE patient_id = ?
