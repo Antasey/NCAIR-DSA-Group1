@@ -1,4 +1,4 @@
-Lightweight Language & Code-Switching Detection
+"""Lightweight Language & Code-Switching Detection
 
 Runs BEFORE N-ATLaS, so the 8B model isn't asked to also figure out what
 language(s) it's dealing with — it's just told directly. This is a cheap,
