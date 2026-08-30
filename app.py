@@ -27,7 +27,7 @@ import json
 from asr.transcribe import transcribe_audio
 from nlp.structure_note import structure_note
 from nlp.extract_keywords import extract_keywords
-from nlp.audio_language_detect import detect_audio_language
+from asr.audio_language_detect import detect_audio_language
 from templates.clinical_note import (
     init_db,
     save_patient_record as db_save_patient_record,
