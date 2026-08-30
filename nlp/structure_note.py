@@ -206,11 +206,10 @@ def structure_note(transcript: str, language_context: str = "") -> dict:
 
     Args:
         transcript: Patient's raw speech (Yoruba/Igbo/Hausa/English)
-        language_context: Optional context string from the lightweight
-            language/code-switching detection stage (nlp/language_detect.py).
-            Passing this in means N-ATLaS doesn't have to figure out the
-            language situation itself — it's told directly, which is meant
-            to reduce both latency and code-switching-related errors.
+        language_context: Optional context string from the audio-based
+            language detection stage (nlp/audio_language_detect.py), run
+            BEFORE ASR on the raw audio. Passing this in means N-ATLaS
+            doesn't have to figure out the language situation itself.
 
     Returns:
         Dict with chief_complaint, duration, severity, history,
