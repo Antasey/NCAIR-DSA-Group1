@@ -88,3 +88,31 @@ def get_patient_history(patient_id):
     visits = cursor.fetchall()
     conn.close()
     return visits
+
+
+def export_all_records_to_csv(output_path="patient_records_export.csv"):
+    """
+    Export the entire clinical_visits table to CSV — every patient, every
+    visit, all fields. Meant for handoff to the hospital's own record
+    system, or for offline analysis/backup.
+    """
+    import csv
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute("""
+        SELECT visit_id, patient_id, chief_complaint, duration, severity,
+               history, possible_recommendations, language,
+               extracted_keywords, raw_transcript, created_at
+        FROM clinical_visits
+        ORDER BY patient_id, created_at DESC
+    """)
+    rows = cursor.fetchall()
+    column_names = [description[0] for description in cursor.description]
+    conn.close()
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(column_names)
+        writer.writerows(rows)
+
+    return output_path, len(rows)
