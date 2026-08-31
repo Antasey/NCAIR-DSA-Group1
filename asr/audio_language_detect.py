@@ -18,13 +18,12 @@ for its language-ID head — this is a separate, lightweight model, loaded
 only once, distinct from the NCAIR ASR models used for actual transcription.
 
 *** IMPORTANT — VERIFY BEFORE RELYING ON THIS IN THE DEMO ***
-Whisper's officially supported language list includes Yoruba ('yo') and
-Hausa ('ha'), but Igbo is NOT confirmed to be in Whisper's standard
-language set. This needs to be empirically tested in Colab before the
-live demo — if Igbo isn't reliably detected, the fallback below (manual
-selection when confidence is low or the detected language isn't one of
-our three targets) is what protects the demo from silently mislabeling
-Igbo audio as something else.
+Whisper officially supports Hausa, Igbo, and Yoruba for language identification. 
+However, detection is not perfectly reliable, especially with accented,
+short, or noisy recordings. For this reason, the application uses a confidence
+threshold and falls back to manual language selection whenever the detected 
+language is unsupported or the confidence is too low. This prevents 
+the wrong ASR model from being selected. 
 """
 
 import logging
