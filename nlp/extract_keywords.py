@@ -1,120 +1,61 @@
 """
-Keyword extraction from patient speech — identifies clinical entities
-(symptoms, duration, severity, anatomical mentions) to highlight in the
-structured note for doctor review.
+extract.py
+
+Secondary, reference-only keyword/entity extraction.
+
+Instead of matching the note against a fixed vocabulary, N-ATLaS itself
+identifies the clinically relevant terms — so it can surface things
+that weren't anticipated ahead of time. This stays a sidebar, never
+authoritative over the structured note from structure.py.
 """
-import re
-from typing import List, Dict
 
-# Clinical keywords by category (expand this based on domain knowledge)
-SYMPTOM_KEYWORDS = [
-    "pain", "fever", "cough", "vomiting", "nausea", "headache", "dizziness",
-    "fatigue", "weakness", "rash", "itching", "swelling", "difficulty breathing",
-    "chest pain", "abdominal pain", "back pain", "joint pain"
-]
+import json
+import logging
+from typing import List
 
-DURATION_PATTERNS = [
-    r"(\d+\s*(?:day|week|month|year|hour)s?)",
-    r"(since\s+(?:yesterday|today|last\s+\w+))",
-    r"(for\s+\d+\s*(?:day|week|month)s?)"
-]
+from structure import get_llm
 
-SEVERITY_KEYWORDS = [
-    "mild", "moderate", "severe", "unbearable", "manageable",
-    "very bad", "really bad", "not too bad", "little bit"
-]
+logger = logging.getLogger(__name__)
 
-ANATOMICAL_SITES = [
-    "head", "chest", "stomach", "abdomen", "back", "arm", "leg",
-    "throat", "eye", "ear", "joint", "knee", "shoulder"
-]
+EXTRACT_SYSTEM_PROMPT = (
+    "You are reviewing a clinical intake note. Identify the clinically "
+    "relevant keywords in it: symptoms, affected body parts/systems, "
+    "duration/frequency terms, and anything else a clinician would want "
+    "flagged at a glance. Only include terms that actually appear in or "
+    "are directly stated by the note — do not infer symptoms that were "
+    "not mentioned, and do not suggest diagnoses or causes. Respond with "
+    "ONLY a JSON array of short strings, no commentary, for example: "
+    '["fever", "3 days duration", "abdominal pain"].'
+)
 
-def extract_keywords(transcript: str) -> Dict[str, List[str]]:
+
+def extract_keywords(note_text: str) -> List[str]:
+    """Ask the model to freely identify relevant keywords in a note.
+
+    This is intentionally open-ended: the model isn't given a fixed
+    list to search for, so it can surface terms it wasn't told to look
+    for in advance. Reference/sidebar use only.
     """
-    Extract clinical keywords from patient transcript.
-    Returns dict with categories: symptoms, duration, severity, anatomy.
-    """
-    transcript_lower = transcript.lower()
-    
-    extracted = {
-        "symptoms": [],
-        "duration": [],
-        "severity": [],
-        "anatomical_sites": []
-    }
-    
-    # Extract symptoms
-    for symptom in SYMPTOM_KEYWORDS:
-        if symptom in transcript_lower:
-            extracted["symptoms"].append(symptom)
-    
-    # Extract duration mentions
-    for pattern in DURATION_PATTERNS:
-        matches = re.findall(pattern, transcript_lower, re.IGNORECASE)
-        extracted["duration"].extend(matches)
-    
-    # Extract severity
-    for severity in SEVERITY_KEYWORDS:
-        if severity in transcript_lower:
-            extracted["severity"].append(severity)
-    
-    # Extract anatomical sites
-    for site in ANATOMICAL_SITES:
-        if site in transcript_lower:
-            extracted["anatomical_sites"].append(site)
-    
-    # Remove duplicates
-    for key in extracted:
-        extracted[key] = list(set(extracted[key]))
-    
-    return extracted
+    llm = get_llm()  # reuses the same in-memory model as structure.py
 
-def highlight_keywords(note: Dict, keywords: Dict[str, List[str]]) -> str:
-    """
-    Render the structured note as HTML with keywords highlighted.
-    Doctor sees the note with color-coded keywords for quick scanning.
-    """
-    all_keywords = []
-    for category, items in keywords.items():
-        all_keywords.extend(items)
-    
-    html = "<div style='font-family: Arial; line-height: 1.6;'>"
-    
-    # Chief Complaint
-    chief = note.get("chief_complaint", "")
-    html += f"<h4>Chief Complaint</h4>"
-    html += f"<p>{_highlight_text(chief, all_keywords)}</p>"
-    
-    # Duration
-    duration = note.get("duration", "")
-    html += f"<h4>Duration</h4>"
-    html += f"<p>{_highlight_text(duration, keywords.get('duration', []))}</p>"
-    
-    # Severity
-    severity = note.get("severity", "")
-    html += f"<h4>Severity</h4>"
-    html += f"<p>{_highlight_text(severity, keywords.get('severity', []))}</p>"
-    
-    # History
-    history = note.get("history", "")
-    html += f"<h4>Relevant History</h4>"
-    html += f"<p>{_highlight_text(history, all_keywords)}</p>"
-    
-    html += "</div>"
-    return html
+    result = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+            {"role": "user", "content": note_text},
+        ],
+        temperature=0.1,
+        max_tokens=200,
+    )
 
-def _highlight_text(text: str, keywords: List[str]) -> str:
-    """
-    Internal: highlight keywords in text with yellow background.
-    """
-    if not text:
-        return text
-    
-    highlighted = text
-    for keyword in set(keywords):  # avoid duplicate highlighting
-        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
-        highlighted = pattern.sub(
-            f'<mark style="background-color: #FFFF00;">{keyword}</mark>',
-            highlighted
-        )
-    return highlighted
+    raw = result["choices"][0]["message"]["content"].strip()
+
+    try:
+        keywords = json.loads(raw)
+        if not isinstance(keywords, list):
+            raise ValueError("expected a JSON array")
+        keywords = [str(k).strip() for k in keywords if str(k).strip()]
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Keyword extraction did not return a valid JSON array")
+        keywords = []
+
+    return keywords
