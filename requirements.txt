@@ -1,14 +1,26 @@
-transformers>=4.40.0
+# UI (hosted, not desktop -- this app runs as a Gradio Blocks app)
+gradio>=4.20.0
+
+# N-ATLaS (LLM structuring + keyword extraction) runs via GGUF, NOT
+# transformers/bitsandbytes -- llama-cpp-python loads the model, and
+# huggingface_hub auto-downloads the GGUF file on first use (same
+# auto-download pattern transformers uses for the ASR models below).
+llama-cpp-python>=0.2.0
+huggingface_hub>=0.23.0
+
+# ASR (asr/transcribe.py) still uses the NCAIR Whisper-Small fine-tunes via
+# transformers/torch -- these were never converted to GGUF, only N-ATLaS was.
 torch>=2.2.0
-torchaudio>=2.2.0
+transformers>=4.40.0
+
+# Whisper (language detection + code-switch check, nlp/audio_language_detect.py)
+# -- shares the torch install above, not a separate heavy dependency.
+openai-whisper>=20231117
+
+# Audio preprocessing pipeline (asr/transcribe.py)
 librosa>=0.10.0
 soundfile>=0.12.0
 noisereduce>=3.0.0
 pydub>=0.25.0
-jiwer>=3.0.0
-openai-whisper>=20231117
-accelerate>=0.30.0
-bitsandbytes>=0.43.0
-gradio>=4.20.0
-python-dotenv>=1.0.0
 
+python-dotenv>=1.0.0
