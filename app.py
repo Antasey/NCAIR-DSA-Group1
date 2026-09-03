@@ -1,458 +1,457 @@
 """
-NCAIR-DSA — Gradio entry point.
+MediVoice — Multi-Lingual Patient Intake Assistant (Gradio / hosted version)
 
-Pipeline: audio capture -> audio-based language detection (BEFORE ASR) ->
-ASR -> N-ATLaS structuring (clinical note + possible recommendations) ->
-keyword extraction -> role-gated review -> patient record save -> exports.
+Same backend logic and screen flow as the CustomTkinter desktop build
+(gui/app.py, gui/nurse_flow.py, gui/doctor_flow.py) — restyled to run as a
+hosted Gradio app instead of a native window, so nothing has to be
+downloaded/installed by end users. Visual design matches the MediVoice
+reference screenshot: white canvas, deep teal accent, rounded cards.
 
-Role model:
-  - NURSE view: capture only (patient ID, audio, language detection/confirm).
-    No access to clinical note editing, recommendations, or exports.
-  - DOCTOR view: full review (Clinical Note / Possible Recommendations /
-    Keywords tabs), save, patient history lookup, CSV/TXT exports.
+Screen flow (mirrors the desktop app):
+    Dashboard (landing) --"New Intake"--> role picker
+        --Nurse--> Nurse capture flow
+        --Doctor--> Patients queue (same destination as the sidebar link)
+    Patients (sidebar) --"Review"--> Doctor review screen --"Confirm & Finalize"--> back to queue
 
-This mirrors how the tool would realistically be used in a clinic: a nurse
-handles intake, a doctor handles clinical review — they are not the same
-job and should not see the same screen.
-
-NOTE: Google Drive must be mounted BEFORE running this script, from a
-notebook cell — not from inside app.py. In your Colab notebook:
-    from google.colab import drive
-    drive.mount('/content/drive')
-THEN run: !python app.py
+Run with: python app.py
+Expects nlp/, asr/, templates/ as sibling folders (same layout as the rest
+of this project) — nothing here changes those modules.
 """
-import gradio as gr
+
 import json
+import os
+import sys
+import tempfile
 
-from asr.transcribe import transcribe_audio
-from nlp.structure_note import structure_note
-from nlp.extract_keywords import extract_keywords
-from asr.audio_language_detect import detect_audio_language
-from templates.clinical_note import (
-    init_db,
-    save_patient_record as db_save_patient_record,
-    get_patient_history,
-    export_all_records_to_csv,
-)
+import gradio as gr
 
-# Ensure database tables exist on startup
-init_db()
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "nlp"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "asr"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "templates"))
+
+import clinical_note as db  # noqa: E402
+
+LANGUAGES = ["Hausa", "Igbo", "Yoruba"]
 
 RECOMMENDATIONS_DISCLAIMER = (
-    "⚠️ For doctor consideration only — NOT a diagnosis. "
-    "This is a model-generated suggestion and may be incomplete or inaccurate. "
-    "Clinical judgment should always take precedence.\n\n"
+    "⚠️ For doctor consideration only — NOT a diagnosis. This is a "
+    "model-generated suggestion and may be incomplete or inaccurate. "
+    "Clinical judgment should always take precedence."
 )
 
-SEVERITY_COLORS = {
-    "mild": "#2e7d32",
-    "moderate": "#ef6c00",
-    "severe": "#c62828",
-}
-
-
-def severity_badge_html(severity_text: str) -> str:
-    if not severity_text:
-        return ""
-    lowered = severity_text.lower()
-    color = "#666666"
-    label = "Unspecified"
-    for key, hex_color in SEVERITY_COLORS.items():
-        if key in lowered:
-            color = hex_color
-            label = key.capitalize()
-            break
-    return (
-        f'<div style="display:inline-block; padding:4px 14px; border-radius:14px; '
-        f'background-color:{color}; color:white; font-weight:600; font-size:0.85em;">'
-        f'{label}</div>'
-    )
-
-
 # ============================================================================
-# Language Detection (runs on raw audio, BEFORE ASR)
+# THEME — ported from gui/theme.py
 # ============================================================================
 
-def run_language_detection(audio_file, manual_language):
-    """
-    Called when audio is captured. Detects language directly from audio.
-    If confident, suggests it (nurse can still override). If not confident,
-    falls back to whatever the nurse manually selected.
-    """
-    if not audio_file:
-        return manual_language, "No audio yet — select language manually or record audio first."
+COLOR_BG = "#F7F9FA"
+COLOR_WHITE = "#FFFFFF"
+COLOR_TEAL = "#1B6B6B"
+COLOR_TEAL_HOVER = "#155454"
+COLOR_TEAL_LIGHT = "#E4F0EF"
+COLOR_TEXT_DARK = "#16232E"
+COLOR_TEXT_BODY = "#374151"
+COLOR_TEXT_MUTED = "#6B7280"
+COLOR_CARD_BORDER = "#E5E7EB"
+COLOR_SUCCESS = "#22C55E"
+COLOR_WARNING = "#F59E0B"
+COLOR_DANGER = "#DC2626"
 
-    result = detect_audio_language(audio_file)
+SEVERITY_COLORS = {"mild": "#2E7D32", "moderate": "#EF6C00", "severe": "#C62828"}
 
-    if result["auto_detect_reliable"]:
-        detected = result["detected_language"]
-        msg = f"✓ Auto-detected: {detected} (confidence: {result['confidence']:.0%})"
-        return detected, msg
-    else:
-        msg = (
-            f"⚠ Auto-detection not confident enough (top guess confidence: "
-            f"{result['confidence']:.0%}). Please confirm the language manually."
-        )
-        return manual_language, msg
-
-
-# ============================================================================
-# Main Pipeline
-# ============================================================================
-
-def process_patient_intake(patient_id, language, audio_file):
-    """
-    1. Transcribe audio (language already decided by this point — either
-       auto-detected or manually confirmed, upstream of this function)
-    2. Structure into full English clinical note + possible recommendations
-    3. Extract keywords from the ENGLISH note (not raw transcript)
-    """
-    if not audio_file or not patient_id:
-        return "", "", "", "", "", "", "", "", "", "{}", "Error: Patient ID and audio required"
-
-    try:
-        transcript = transcribe_audio(audio_file, language)
-    except Exception as e:
-        return "", "", "", "", "", "", "", "", "", "{}", f"Error transcribing audio: {str(e)}"
-
-    language_context = f"Language: {language} (confirmed prior to ASR via audio-based detection or nurse selection)."
-    note = structure_note(transcript, language_context=language_context)
-
-    if note.get("_error"):
-        status = f"⚠ Note generated with issues: {note['_error']}"
-    else:
-        status = "✓ Ready for doctor review"
-
-    english_note_text = " ".join([
-        note.get("chief_complaint", ""),
-        note.get("duration", ""),
-        note.get("severity", ""),
-        note.get("history", ""),
-    ])
-    keywords = extract_keywords(english_note_text)
-
-    keywords_text = f"""Symptoms Detected:
-{', '.join(keywords.get('symptoms', [])) if keywords.get('symptoms') else 'None'}
-
-Duration Mentions:
-{', '.join(keywords.get('duration', [])) if keywords.get('duration') else 'None'}
-
-Severity Language:
-{', '.join(keywords.get('severity', [])) if keywords.get('severity') else 'None'}
-
-Anatomical Sites:
-{', '.join(keywords.get('anatomical_sites', [])) if keywords.get('anatomical_sites') else 'None'}
+CUSTOM_CSS = f"""
+.gradio-container {{ background: {COLOR_BG} !important; font-family: 'Segoe UI', sans-serif; }}
+#sidebar {{ background: {COLOR_WHITE}; border-right: 1px solid {COLOR_CARD_BORDER}; min-height: 100vh; }}
+.nav-btn {{ text-align: left !important; justify-content: flex-start !important; }}
+.nav-btn.active {{ background: {COLOR_TEAL} !important; color: {COLOR_WHITE} !important; }}
+.card {{ background: {COLOR_WHITE}; border: 1px solid {COLOR_CARD_BORDER}; border-radius: 14px; padding: 20px; }}
+.stat-card {{ background: {COLOR_WHITE}; border: 1px solid {COLOR_CARD_BORDER}; border-radius: 14px;
+              padding: 20px; }}
+.stat-label {{ color: {COLOR_TEXT_MUTED}; font-size: 11px; font-weight: 700; letter-spacing: .04em; }}
+.stat-number {{ color: {COLOR_TEXT_DARK}; font-size: 32px; font-weight: 700; margin: 4px 0; }}
+.stat-caption {{ color: {COLOR_TEXT_MUTED}; font-size: 12px; }}
+.cta-banner {{ background: linear-gradient(135deg, {COLOR_TEAL}, {COLOR_TEAL_HOVER}); border-radius: 14px;
+               padding: 28px 32px; color: {COLOR_WHITE}; }}
+.cta-eyebrow {{ font-size: 11px; font-weight: 700; letter-spacing: .04em; color: {COLOR_TEAL_LIGHT}; }}
+.cta-title {{ font-size: 26px; font-weight: 700; margin: 6px 0 8px; }}
+.cta-body {{ color: {COLOR_TEAL_LIGHT}; font-size: 13px; }}
+.disclaimer {{ color: {COLOR_WARNING}; font-size: 12px; }}
+.status-ok {{ color: {COLOR_SUCCESS}; }}
+.status-err {{ color: {COLOR_DANGER}; }}
+.queue-row {{ background: {COLOR_WHITE}; border: 1px solid {COLOR_CARD_BORDER}; border-radius: 14px;
+              padding: 14px 20px; margin-bottom: 8px; }}
+#primary-btn {{ background: {COLOR_TEAL} !important; color: {COLOR_WHITE} !important; border: none !important; }}
+#primary-btn:hover {{ background: {COLOR_TEAL_HOVER} !important; }}
 """
 
-    severity_html = severity_badge_html(note.get("severity", ""))
-    recommendations_with_disclaimer = RECOMMENDATIONS_DISCLAIMER + note.get("possible_recommendations", "")
-
-    return (
-        note.get("chief_complaint", ""),
-        note.get("duration", ""),
-        note.get("severity", ""),
-        note.get("history", ""),
-        severity_html,
-        recommendations_with_disclaimer,
-        keywords_text,
-        transcript,             # shown separately, kept distinct from the structured note
-        transcript,             # hidden state — needed at save time
-        json.dumps(keywords),   # hidden state — needed at save time
-        status,
-    )
+# ============================================================================
+# HELPERS — building the same HTML blocks the desktop app draws with CTk
+# ============================================================================
 
 
-def handle_save_click(patient_id, language, chief_complaint, duration, severity, history,
-                       recommendations_text, transcript_state, keywords_state_json):
-    if not patient_id:
-        return "Error: Patient ID is required to save"
+def render_dashboard():
+    stats = db.get_dashboard_stats()
+    stat_html = f"""
+    <div style="display:flex; gap:16px; margin-bottom:20px;">
+      <div class="stat-card" style="flex:1;">
+        <div class="stat-label">TOTAL PATIENTS</div>
+        <div class="stat-number">{stats['total_patients']}</div>
+        <div class="stat-caption">Registered patients</div>
+      </div>
+      <div class="stat-card" style="flex:1;">
+        <div class="stat-label">CLINICAL VISITS</div>
+        <div class="stat-number">{stats['total_visits']}</div>
+        <div class="stat-caption">Recorded visits</div>
+      </div>
+      <div class="stat-card" style="flex:1;">
+        <div class="stat-label">PENDING REVIEW</div>
+        <div class="stat-number">{stats['pending_review']}</div>
+        <div class="stat-caption">Awaiting doctor</div>
+      </div>
+    </div>
+    <div class="cta-banner">
+      <div class="cta-eyebrow">START A NEW PATIENT INTAKE</div>
+      <div class="cta-title">Capture patient information<br/>through voice-powered intake.</div>
+      <div class="cta-body">Record symptoms in Igbo, Hausa or Yoruba and transform the
+      conversation into structured clinical information.</div>
+    </div>
+    """
+    pending = db.get_pending_visits()
+    if not pending:
+        activity_html = f'<p style="color:{COLOR_TEXT_MUTED};">No recent activity yet.</p>'
+    else:
+        rows = ""
+        for visit_id, patient_id, chief_complaint, language, created_at in pending[:5]:
+            rows += f"""
+            <div class="queue-row">
+              <div style="font-weight:700; color:{COLOR_TEXT_DARK};">{patient_id} · {chief_complaint or 'Pending structuring'}</div>
+              <div style="color:{COLOR_TEXT_MUTED}; font-size:12px;">{language} · {created_at} · Pending review</div>
+            </div>
+            """
+        activity_html = rows
+    return stat_html, activity_html
+
+
+def render_queue():
+    pending = db.get_pending_visits()
+    if not pending:
+        return f'<div class="card"><span class="status-ok">✓ No visits waiting for review.</span></div>', []
+    rows_html = ""
+    choices = []
+    for visit_id, patient_id, chief_complaint, language, created_at in pending:
+        rows_html += f"""
+        <div class="queue-row">
+          <div style="font-weight:700; color:{COLOR_TEXT_DARK};">Patient {patient_id}</div>
+          <div style="color:{COLOR_TEXT_BODY};">{chief_complaint or 'Awaiting structuring'}</div>
+          <div style="color:{COLOR_TEXT_MUTED}; font-size:12px;">{language} · {created_at}</div>
+        </div>
+        """
+        choices.append(f"Visit #{visit_id} — {patient_id}")
+    return rows_html, choices
+
+
+def severity_color(severity_text):
+    if not severity_text:
+        return COLOR_TEXT_MUTED
+    lowered = severity_text.lower()
+    for key, color in SEVERITY_COLORS.items():
+        if key in lowered:
+            return color
+    return COLOR_TEXT_MUTED
+
+
+def format_keywords(keywords_json):
     try:
-        keywords = json.loads(keywords_state_json) if keywords_state_json else {}
-
-        recommendations_to_save = recommendations_text
-        if recommendations_to_save.startswith(RECOMMENDATIONS_DISCLAIMER):
-            recommendations_to_save = recommendations_to_save[len(RECOMMENDATIONS_DISCLAIMER):]
-
-        db_save_patient_record(
-            patient_id=patient_id,
-            chief_complaint=chief_complaint,
-            duration=duration,
-            severity=severity,
-            history=history,
-            possible_recommendations=recommendations_to_save,
-            language=language,
-            keywords=keywords,
-            transcript=transcript_state,
-        )
-        return f"✓ Patient {patient_id} record saved successfully"
-    except Exception as e:
-        return f"✗ Error saving record: {str(e)}"
-
-
-def handle_view_history_click(patient_id):
-    if not patient_id:
-        return "Enter a Patient ID to view history"
-    visits = get_patient_history(patient_id)
-    if not visits:
-        return f"No previous visits found for patient {patient_id}"
-    lines = [f"History for {patient_id} ({len(visits)} visit(s)):\n"]
-    for visit in visits:
-        visit_id, chief_complaint, duration, severity, history, recommendations, language, created_at = visit
-        lines.append(
-            f"— {created_at} [{language}]\n"
-            f"  Complaint: {chief_complaint}\n"
-            f"  Duration: {duration}\n"
-            f"  Severity: {severity}\n"
-            f"  History: {history}\n"
-            f"  Recommendations: {recommendations}\n"
-        )
+        data = json.loads(keywords_json) if keywords_json else {}
+    except json.JSONDecodeError:
+        data = {}
+    lines = []
+    for category in ["symptoms", "duration", "severity", "anatomical_sites"]:
+        values = data.get(category, [])
+        lines.append(f"{category.replace('_', ' ').title()}: " + (", ".join(values) if values else "None"))
     return "\n".join(lines)
 
 
+def extract_visit_id(choice_label):
+    # "Visit #12 — P001" -> 12
+    return int(choice_label.split("—")[0].replace("Visit #", "").strip())
+
+
 # ============================================================================
-# Exports
+# BACKEND ACTIONS — identical calls to nurse_flow.py / doctor_flow.py
 # ============================================================================
 
-def handle_export_csv():
-    """Export the full patient database as a downloadable CSV."""
+
+def run_language_detection(audio_path):
+    if not audio_path:
+        return gr.update(), ""
     try:
-        path, row_count = export_all_records_to_csv("patient_records_export.csv")
-        return path, f"✓ Exported {row_count} record(s) to CSV"
+        from audio_language_detect import detect_audio_language
+        result = detect_audio_language(audio_path)
+        if result["auto_detect_reliable"]:
+            msg = f"✓ Auto-detected: {result['detected_language']} (confidence: {result['confidence']:.0%})"
+            lang_update = gr.update(value=result["detected_language"])
+        else:
+            msg = f"⚠ Detection not confident ({result['confidence']:.0%}) — confirm language manually."
+            lang_update = gr.update()
+        if result.get("is_code_switched"):
+            candidates = ", ".join(f"{l} ({p:.0%})" for l, p in result["code_switch_candidates"])
+            msg += f"\n⚠ Possible code-switching detected: {candidates}. Processing will continue."
+        return lang_update, msg
     except Exception as e:
-        return None, f"✗ Export failed: {str(e)}"
+        return gr.update(), f"⚠ Language detection unavailable: {e}. Select language manually."
 
 
-def handle_export_transcript_txt(patient_id, chief_complaint, duration, severity,
-                                  history, transcript_state):
-    """
-    Export the translated (English) clinical note as plain text, alongside
-    the original untranslated transcript for reference — so if N-ATLaS
-    mistranslates something, the original is not lost.
-    """
-    if not patient_id:
-        return None, "Error: Patient ID required to export"
+def process_intake(patient_id, language, audio_path):
+    if not patient_id or not patient_id.strip():
+        return "✗ Please enter a Patient ID before processing.", *render_dashboard()
+    if not audio_path:
+        return "✗ Please provide patient audio before processing.", *render_dashboard()
 
-    filename = f"transcript_{patient_id}.txt"
-    content = f"""NCAIR-DSA — Patient Transcript Export
-Patient ID: {patient_id}
+    try:
+        from transcribe import transcribe_audio
+        from structure_note import structure_note
+        from extract_keywords import extract_keywords
+        from audio_language_detect import detect_audio_language
 
-=== TRANSLATED / STRUCTURED CLINICAL NOTE ===
+        language_context = ""
+        try:
+            detection = detect_audio_language(audio_path)
+            language_context = detection.get("context_note", "")
+        except Exception:
+            pass  # non-fatal — proceed without extra context
 
-Chief Complaint:
-{chief_complaint}
+        transcript = transcribe_audio(audio_path, language)
+        note = structure_note(transcript, language_context=language_context)
+        keywords = extract_keywords(transcript)
 
-Duration:
-{duration}
+        visit_id = db.save_patient_record(
+            patient_id=patient_id.strip(),
+            chief_complaint=note.get("chief_complaint", ""),
+            duration=note.get("duration", ""),
+            severity=note.get("severity", ""),
+            history=note.get("history", ""),
+            possible_recommendations=note.get("possible_recommendations", ""),
+            language=language,
+            keywords=keywords,
+            transcript=transcript,
+        )
+        status = f"✓ Saved. Patient {patient_id}'s visit (#{visit_id}) is now awaiting doctor review."
+    except Exception as e:
+        status = f"✗ Error: {e}"
 
-Severity:
-{severity}
-
-Relevant History:
-{history}
-
-=== ORIGINAL UNTRANSLATED TRANSCRIPT ===
-(kept separately in case of mistranslation or ASR error)
-
-{transcript_state}
-"""
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    return filename, "✓ Transcript exported"
+    stat_html, activity_html = render_dashboard()
+    return status, stat_html, activity_html
 
 
-# ============================================================================
-# Role Switching
-# ============================================================================
+def load_review(choice_label):
+    if not choice_label:
+        return ("", "", "", "", "", "", "", "", gr.update(), None)
+    visit_id = extract_visit_id(choice_label)
+    visit = db.get_visit_by_id(visit_id)
+    if not visit:
+        return ("Visit not found.", "", "", "", "", "", "", "", gr.update(), None)
 
-def switch_role(role):
-    """Toggle visibility of components based on selected role."""
-    is_doctor = (role == "Doctor")
+    (v_id, patient_id, chief_complaint, duration, severity, history,
+     recommendations, language, keywords_json, transcript, status, created_at) = visit
+
+    header = f"Patient {patient_id} · {language} · Visit #{v_id} · {created_at}"
     return (
-        gr.update(visible=is_doctor),  # doctor_review_group
-        gr.update(visible=is_doctor),  # save_group
-        gr.update(visible=is_doctor),  # history_group
-        gr.update(visible=is_doctor),  # export_group
+        header, chief_complaint or "", duration or "", severity or "",
+        history or "", recommendations or "", format_keywords(keywords_json),
+        transcript or "", gr.update(), visit_id,
     )
 
 
+def confirm_and_finalize(visit_id, chief_complaint, duration, severity, history, recommendations):
+    if visit_id is None:
+        return "✗ No visit selected.", *render_queue()
+    db.update_visit_and_mark_reviewed(visit_id, chief_complaint, duration, severity, history, recommendations)
+    msg = f"✓ Visit #{visit_id} finalized."
+    rows_html, choices = render_queue()
+    return msg, rows_html, choices
+
+
+def export_csv(visit_id):
+    if visit_id is None:
+        return None
+    tmp_path = os.path.join(tempfile.gettempdir(), f"visit_{visit_id}.csv")
+    db.export_single_visit_to_csv(visit_id, tmp_path)
+    return tmp_path
+
+
 # ============================================================================
-# Theme
+# APP LAYOUT
 # ============================================================================
 
-theme = gr.themes.Soft(
-    primary_hue="teal",
-    secondary_hue="blue",
-    neutral_hue="slate",
-    font=[gr.themes.GoogleFont("Inter"), "sans-serif"],
-).set(
-    button_primary_background_fill="*primary_600",
-    button_primary_background_fill_hover="*primary_700",
-    block_title_text_weight="600",
-)
+db.init_db()
 
+with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake Assistant") as demo:
+    visit_id_state = gr.State(None)
 
-# ============================================================================
-# Gradio Interface
-# ============================================================================
+    with gr.Row():
+        # ---------------- Sidebar ----------------
+        with gr.Column(scale=1, elem_id="sidebar", min_width=240):
+            gr.HTML(f"""
+                <div style="display:flex; align-items:center; gap:12px; padding:20px 8px;">
+                  <div style="width:44px;height:44px;border-radius:12px;background:{COLOR_TEAL};
+                              display:flex;align-items:center;justify-content:center;
+                              color:white;font-size:22px;font-weight:700;">+</div>
+                  <div>
+                    <div style="font-weight:700; color:{COLOR_TEXT_DARK}; font-size:16px;">MediVoice</div>
+                    <div style="color:{COLOR_TEXT_MUTED}; font-size:11px;">Patient Intake</div>
+                  </div>
+                </div>
+                <div style="color:{COLOR_TEXT_MUTED}; font-size:11px; font-weight:700;
+                            padding:8px 8px 4px;">WORKSPACE</div>
+            """)
+            nav_dashboard = gr.Button("🏠  Dashboard", elem_classes=["nav-btn", "active"])
+            nav_patients = gr.Button("🧑‍⚕️  Patients", elem_classes=["nav-btn"])
+            nav_new_intake = gr.Button("🎙️  New Intake", elem_classes=["nav-btn"])
+            gr.HTML(f"""
+                <div style="margin-top:40px; background:{COLOR_TEAL_LIGHT}; border-radius:14px; padding:12px 14px;">
+                  <div style="color:{COLOR_SUCCESS};">● <b style="color:{COLOR_TEXT_DARK};">System operational</b></div>
+                  <div style="color:{COLOR_TEXT_MUTED}; font-size:11px;">Speech services ready</div>
+                </div>
+            """)
 
-with gr.Blocks(title="NCAIR-DSA: Patient Intake Assistant", theme=theme) as demo:
-    gr.HTML(
-        """
-        <div style="text-align:center; padding: 12px 0 4px 0;">
-            <h1 style="margin-bottom:4px;">🩺 NCAIR-DSA Patient Intake Assistant</h1>
-            <p style="color:#666; font-size:1.05em;">
-                Multi-lingual voice-to-clinical-note system — Hausa · Igbo · Yoruba → English
-            </p>
-        </div>
-        """
-    )
+        # ---------------- Main content ----------------
+        with gr.Column(scale=4):
 
-    transcript_state = gr.State("")
-    keywords_state = gr.State("{}")
+            # ---- Dashboard page ----
+            with gr.Column(visible=True) as dashboard_page:
+                gr.HTML(f'<div style="color:{COLOR_TEXT_MUTED};">Good day 👋</div>'
+                        f'<div style="font-size:28px; font-weight:700; color:{COLOR_TEXT_DARK};">Patient Intake Dashboard</div>'
+                        f'<div style="color:{COLOR_TEXT_MUTED}; margin-bottom:20px;">Manage patient intake and clinical information efficiently.</div>')
+                dash_stats_html = gr.HTML()
+                start_intake_btn = gr.Button("Start Intake  →", elem_id="primary-btn")
+                gr.HTML(f'<div style="font-size:18px; font-weight:700; color:{COLOR_TEXT_DARK}; margin:20px 0 8px;">Recent activity</div>')
+                dash_activity_html = gr.HTML()
 
-    # --- Role Selection ---
-    with gr.Group():
-        gr.Markdown("### 👤 Select Your Role")
-        role_selector = gr.Radio(
-            choices=["Nurse", "Doctor"],
-            value="Nurse",
-            label="Who is using the system right now?",
-            info="Nurses handle intake capture. Doctors review, edit, save, and export."
-        )
-
-    # --- Step 1: Capture (visible to both roles) ---
-    with gr.Group():
-        gr.Markdown("### 🎙️ Step 1 — Record Patient Audio")
-        with gr.Row():
-            patient_id = gr.Textbox(label="Patient ID", placeholder="e.g., P001", scale=1)
-            language = gr.Dropdown(
-                choices=["Hausa", "Igbo", "Yoruba"],
-                label="Language (auto-detected — confirm or override)",
-                scale=1
-            )
-
-        audio_input = gr.Audio(
-            label="Patient Audio (Upload or Record)",
-            type="filepath",
-            sources=["upload", "microphone"]
-        )
-
-        detect_lang_btn = gr.Button("🌐 Detect Language from Audio", size="sm")
-        language_detect_status = gr.Textbox(label="Language Detection Status", interactive=False)
-
-        transcribe_btn = gr.Button("🔄 Transcribe & Generate Clinical Note", variant="primary", size="lg")
-        process_status = gr.Textbox(label="Status", interactive=False)
-
-        gr.Markdown("**Original Transcript (untranslated, kept separately for reference):**")
-        raw_transcript_display = gr.Textbox(label="Raw Transcript", lines=3, interactive=False)
-
-    # --- Step 2: Doctor Review (Doctor role only) ---
-    with gr.Group(visible=False) as doctor_review_group:
-        gr.Markdown("### 📋 Step 2 — Doctor Review & Edit")
-
-        with gr.Tabs():
-            with gr.Tab("🩺 Clinical Note"):
-                gr.Markdown("_Editable — grounded strictly in what the patient said._")
-                chief_complaint = gr.Textbox(label="Chief Complaint", lines=4, interactive=True)
-                duration = gr.Textbox(label="Duration", lines=3, interactive=True)
+            # ---- Role picker page (matches the desktop app's modal) ----
+            with gr.Column(visible=False) as role_page:
+                back_from_role = gr.Button("← Back to Dashboard", elem_classes=["nav-btn"])
+                gr.HTML(f'<div style="text-align:center; margin-top:20px;">'
+                        f'<div style="font-size:22px; font-weight:700; color:{COLOR_TEXT_DARK};">Who\'s using the system?</div>'
+                        f'<div style="color:{COLOR_TEXT_MUTED}; margin-bottom:20px;">Select a role to continue</div></div>')
                 with gr.Row():
-                    severity = gr.Textbox(label="Severity", lines=3, interactive=True, scale=3)
-                    severity_badge = gr.HTML(label="", scale=1)
-                history = gr.Textbox(label="Relevant History", lines=5, interactive=True)
+                    role_nurse_btn = gr.Button("🧑‍⚕️  Nurse\nRecord patient intake", elem_classes=["card"])
+                    role_doctor_btn = gr.Button("🩺  Doctor\nReview pending visits", elem_classes=["card"])
 
-            with gr.Tab("💡 Possible Recommendations"):
-                gr.Markdown(
-                    "_AI-suggested considerations for triage — editable. "
-                    "Not a diagnosis; hedged and conservative by design._"
-                )
-                possible_recommendations = gr.Textbox(
-                    label="Possible Causes / Effects / Considerations",
-                    lines=8,
-                    interactive=True
-                )
+            # ---- Nurse intake page ----
+            with gr.Column(visible=False) as intake_page:
+                back_from_intake = gr.Button("← Back to Dashboard", elem_classes=["nav-btn"])
+                gr.HTML(f'<div style="font-size:24px; font-weight:700; color:{COLOR_TEXT_DARK}; margin-top:8px;">New Patient Intake</div>'
+                        f'<div style="color:{COLOR_TEXT_MUTED}; margin-bottom:16px;">Record or upload patient audio to begin.</div>')
+                with gr.Group(elem_classes=["card"]):
+                    gr.HTML(f'<b style="color:{COLOR_TEXT_DARK};">Patient Details</b>')
+                    with gr.Row():
+                        patient_id_input = gr.Textbox(label="Patient ID", placeholder="e.g. P001")
+                        language_input = gr.Dropdown(LANGUAGES, value=LANGUAGES[0],
+                                                      label="Language (auto-detected — confirm or override)")
+                with gr.Group(elem_classes=["card"]):
+                    gr.HTML(f'<b style="color:{COLOR_TEXT_DARK};">Patient Audio</b>')
+                    audio_input = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Record or upload")
+                    lang_detect_status = gr.Markdown("")
+                process_btn = gr.Button("🔄  Transcribe & Structure Note", elem_id="primary-btn")
+                intake_status = gr.Markdown("")
 
-            with gr.Tab("🔑 Keywords (reference)"):
-                gr.Markdown("_Quick-scan reference only — not part of the saved clinical note._")
-                keywords_display = gr.Textbox(label="Extracted keywords", lines=12, interactive=False)
+            # ---- Doctor queue page ----
+            with gr.Column(visible=False) as queue_page:
+                back_from_queue = gr.Button("← Back to Dashboard", elem_classes=["nav-btn"])
+                gr.HTML(f'<div style="font-size:24px; font-weight:700; color:{COLOR_TEXT_DARK}; margin-top:8px;">Patients</div>'
+                        f'<div style="color:{COLOR_TEXT_MUTED}; margin-bottom:16px;">Visits awaiting doctor review, oldest first.</div>')
+                queue_html = gr.HTML()
+                queue_select = gr.Dropdown(label="Select a visit to review", choices=[])
+                review_btn = gr.Button("Review →", elem_id="primary-btn")
 
-    # --- Step 3: Save (Doctor role only) ---
-    with gr.Group(visible=False) as save_group:
-        gr.Markdown("### 💾 Step 3 — Save to Patient History")
-        save_btn = gr.Button("Save Patient Record to Database", variant="primary", size="lg")
-        save_status = gr.Textbox(label="Save Status", interactive=False)
-
-    # --- History (Doctor role only) ---
-    with gr.Group(visible=False) as history_group:
-        gr.Markdown("### 📖 View Patient Clinical History")
-        history_btn = gr.Button("View History for This Patient ID")
-        history_display = gr.Textbox(label="Past Visits", lines=8, interactive=False)
-
-    # --- Exports (Doctor role only) ---
-    with gr.Group(visible=False) as export_group:
-        gr.Markdown("### 📤 Export")
-        with gr.Row():
-            with gr.Column():
-                export_csv_btn = gr.Button("Export Full Database as CSV")
-                export_csv_file = gr.File(label="Database CSV", interactive=False)
-                export_csv_status = gr.Textbox(label="Export Status", interactive=False)
-            with gr.Column():
-                export_txt_btn = gr.Button("Export This Transcript as Plain Text")
-                export_txt_file = gr.File(label="Transcript TXT", interactive=False)
-                export_txt_status = gr.Textbox(label="Export Status", interactive=False)
+            # ---- Doctor review page ----
+            with gr.Column(visible=False) as review_page:
+                back_from_review = gr.Button("← Back to Patients", elem_classes=["nav-btn"])
+                review_header = gr.Markdown("")
+                with gr.Tabs():
+                    with gr.Tab("🩺 Clinical Note"):
+                        gr.Markdown("Editable — grounded strictly in what the patient said.")
+                        chief_complaint_box = gr.Textbox(label="Chief Complaint", lines=3)
+                        duration_box = gr.Textbox(label="Duration", lines=2)
+                        severity_box = gr.Textbox(label="Severity", lines=2)
+                        history_box = gr.Textbox(label="Relevant History", lines=4)
+                    with gr.Tab("💡 Possible Recommendations"):
+                        gr.HTML(f'<div class="disclaimer">{RECOMMENDATIONS_DISCLAIMER}</div>')
+                        recommendations_box = gr.Textbox(label="", lines=6)
+                    with gr.Tab("🔑 Keywords"):
+                        gr.Markdown("Quick-scan reference only — not part of the saved clinical note.")
+                        keywords_display = gr.Textbox(label="", lines=6, interactive=False)
+                gr.Markdown("**Original Transcript** (untranslated, kept for reference)")
+                transcript_display = gr.Textbox(label="", lines=3, interactive=False)
+                with gr.Row():
+                    finalize_btn = gr.Button("✓  Confirm & Finalize", elem_id="primary-btn")
+                    export_btn = gr.Button("📤  Export Visit as CSV")
+                review_status = gr.Markdown("")
+                export_file = gr.File(label="Download", visible=True)
 
     # ------------------------------------------------------------------
-    # Wire up events
+    # Navigation wiring
     # ------------------------------------------------------------------
 
-    role_selector.change(
-        fn=switch_role,
-        inputs=[role_selector],
-        outputs=[doctor_review_group, save_group, history_group, export_group]
+    all_pages = [dashboard_page, role_page, intake_page, queue_page, review_page]
+
+    def goto(page_index, *_):
+        return [gr.update(visible=(i == page_index)) for i in range(len(all_pages))]
+
+    def refresh_dashboard():
+        stat_html, activity_html = render_dashboard()
+        return stat_html, activity_html
+
+    def refresh_queue():
+        rows_html, choices = render_queue()
+        return rows_html, gr.update(choices=choices, value=None)
+
+    nav_dashboard.click(lambda: goto(0), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    nav_new_intake.click(lambda: goto(1), outputs=all_pages)  # -> role picker, same as desktop app's modal
+    start_intake_btn.click(lambda: goto(1), outputs=all_pages)  # -> role picker
+    nav_patients.click(lambda: goto(3), outputs=all_pages).then(refresh_queue, outputs=[queue_html, queue_select])
+
+    # Role picker: Nurse -> intake flow, Doctor -> same Patients queue as the sidebar link
+    # (mirrors the desktop app's _select_role, which routes Doctor to show_doctor_queue()
+    # rather than dead-ending)
+    role_nurse_btn.click(lambda: goto(2), outputs=all_pages)
+    role_doctor_btn.click(lambda: goto(3), outputs=all_pages).then(refresh_queue, outputs=[queue_html, queue_select])
+    back_from_role.click(lambda: goto(0), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+
+    back_from_intake.click(lambda: goto(0), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    back_from_queue.click(lambda: goto(0), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    back_from_review.click(lambda: goto(3), outputs=all_pages).then(refresh_queue, outputs=[queue_html, queue_select])
+
+    # ------------------------------------------------------------------
+    # Nurse intake wiring
+    # ------------------------------------------------------------------
+
+    audio_input.change(run_language_detection, inputs=[audio_input], outputs=[language_input, lang_detect_status])
+    process_btn.click(
+        process_intake,
+        inputs=[patient_id_input, language_input, audio_input],
+        outputs=[intake_status, dash_stats_html, dash_activity_html],
     )
 
-    detect_lang_btn.click(
-        fn=run_language_detection,
-        inputs=[audio_input, language],
-        outputs=[language, language_detect_status]
+    # ------------------------------------------------------------------
+    # Doctor queue / review wiring
+    # ------------------------------------------------------------------
+
+    review_btn.click(lambda: goto(4), outputs=all_pages).then(
+        load_review,
+        inputs=[queue_select],
+        outputs=[review_header, chief_complaint_box, duration_box, severity_box, history_box,
+                 recommendations_box, keywords_display, transcript_display, review_status, visit_id_state],
     )
 
-    transcribe_btn.click(
-        fn=process_patient_intake,
-        inputs=[patient_id, language, audio_input],
-        outputs=[
-            chief_complaint, duration, severity, history, severity_badge,
-            possible_recommendations, keywords_display,
-            raw_transcript_display, transcript_state, keywords_state, process_status
-        ]
+    finalize_btn.click(
+        confirm_and_finalize,
+        inputs=[visit_id_state, chief_complaint_box, duration_box, severity_box, history_box, recommendations_box],
+        outputs=[review_status, queue_html, queue_select],
     )
 
-    save_btn.click(
-        fn=handle_save_click,
-        inputs=[
-            patient_id, language, chief_complaint, duration, severity, history,
-            possible_recommendations, transcript_state, keywords_state
-        ],
-        outputs=[save_status]
-    )
+    export_btn.click(export_csv, inputs=[visit_id_state], outputs=[export_file])
 
-    history_btn.click(
-        fn=handle_view_history_click,
-        inputs=[patient_id],
-        outputs=[history_display]
-    )
-
-    export_csv_btn.click(
-        fn=handle_export_csv,
-        inputs=[],
-        outputs=[export_csv_file, export_csv_status]
-    )
-
-    export_txt_btn.click(
-        fn=handle_export_transcript_txt,
-        inputs=[patient_id, chief_complaint, duration, severity, history, transcript_state],
-        outputs=[export_txt_file, export_txt_status]
-    )
 
 if __name__ == "__main__":
-    demo.launch(share=True, debug=True)
+    demo.launch()
