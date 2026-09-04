@@ -1,6 +1,6 @@
 # MediVoice — Multi-Lingual Patient Intake Assistant
 
-**NCAIR-DSA Group 1 Project**
+**NCAIR-DSA Group 1 Cohort 37 Project**
 
 A voice-powered clinical intake system that enables patients to describe symptoms in **Yoruba, Igbo, or Hausa**, and automatically structures the conversation into a standardized **English clinical note** for doctor review.
 
