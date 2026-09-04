@@ -2,116 +2,203 @@
 LLM Structuring Stage — converts raw patient transcripts into structured
 English clinical notes using N-ATLaS LLM.
 
-Runs LOCALLY on CPU via a GGUF file (llama-cpp-python). The GGUF weights
-are auto-downloaded from Hugging Face Hub on first use and cached locally
-after that — same behavior as asr/transcribe.py's transformers.pipeline()
-auto-download, just using huggingface_hub directly since GGUF files aren't
-loaded through transformers. No manual browser download needed.
+Loaded via Hugging Face transformers with 4-bit quantization.
+Run `python setup_models.py` BEFORE starting the app to download the model.
 
-Set the HF_TOKEN environment variable if the model repo ever requires
-authentication (QuantFactory's repos are typically public/ungated, so this
-is usually optional — included for parity with how gated repos are handled
-elsewhere, and in case that changes).
-
-Still requires llama-cpp-python to be installed — this only automates
-getting the model FILE onto disk, not the separate llama-cpp-python
-install/compile step.
+Colab-specific fixes:
+  • low_cpu_mem_usage=True to prevent RAM blow-up during loading
+  • Graceful fallback to CPU if GPU OOM
+  • Clear error messages if the model can't load
 """
 
-import os
-import re
+from __future__ import annotations
+
 import json
 import logging
+import os
+import re
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Final
 
-from huggingface_hub import hf_hub_download
-from llama_cpp import Llama
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Hugging Face repo + filename to auto-download from, matching the
-# QuantFactory GGUF quantization confirmed to exist for this project.
-HF_REPO_ID = "QuantFactory/N-ATLaS-GGUF"
-HF_FILENAME = "N-ATLaS.Q4_K_M.gguf"
-HF_TOKEN = os.getenv("HF_TOKEN")  # optional — only needed if the repo is gated
+LOCAL_MODEL_DIR: Final = Path("models/N-ATLaS")
+N_CTX: Final = 3072
+MAX_RETRIES: Final = 2
 
-# If a file already exists at this local path, it's used directly and the
-# download is skipped entirely — lets you still manually place a file here
-# if you'd rather not rely on auto-download (e.g. offline-only machines).
-LOCAL_MODEL_PATH = Path("models/N-ATLaS.Q4_K_M.gguf")
-
-N_CTX = 3072          # plenty for a transcript + this prompt + a JSON note
-N_THREADS = 6          # set to the target machine's physical core count
-N_GPU_LAYERS = 0       # CPU only; raise if an iGPU/dGPU is available
-
-# ============================================================================
-# MODEL LOADING (happens once, on first use — shared with extract_keywords.py)
-# ============================================================================
-
-_llm: Optional[Llama] = None
-_llm_lock = Lock()
+# ── model singleton ─────────────────────────────────────────────────────────
+_model: AutoModelForCausalLM | None = None
+_tokenizer: AutoTokenizer | None = None
+_model_lock = Lock()
 
 
-def _resolve_model_path() -> str:
-    """
-    Return a usable local path to the GGUF file — either an existing
-    manually-placed file, or an auto-download from Hugging Face Hub
-    (cached after the first call, same as transformers' cache behavior).
-    """
-    if LOCAL_MODEL_PATH.exists():
-        logger.info(f"Using existing local model file: {LOCAL_MODEL_PATH}")
-        return str(LOCAL_MODEL_PATH)
+def _verify_model_download() -> None:
+    """Check that the model was fully downloaded."""
+    if not LOCAL_MODEL_DIR.exists():
+        raise RuntimeError(
+            f"Model directory not found: {LOCAL_MODEL_DIR}\n"
+            f"Please run: python setup_models.py"
+        )
 
-    logger.info(
-        f"No local model file found at {LOCAL_MODEL_PATH}. "
-        f"Downloading {HF_FILENAME} from {HF_REPO_ID} (first run only, "
-        f"cached after this)..."
+    required_files = ["config.json", "tokenizer.json"]
+    missing = [f for f in required_files if not (LOCAL_MODEL_DIR / f).exists()]
+    if missing:
+        raise RuntimeError(
+            f"Model download appears incomplete. Missing: {missing}\n"
+            f"Please re-run: python setup_models.py"
+        )
+
+    # Check for model weights
+    has_weights = any(
+        (LOCAL_MODEL_DIR / f).exists() 
+        for f in ["model.safetensors", "pytorch_model.bin", "model-00001-of-00002.safetensors"]
     )
-    downloaded_path = hf_hub_download(
-        repo_id=HF_REPO_ID,
-        filename=HF_FILENAME,
-        token=HF_TOKEN,
-    )
-    logger.info(f"Model downloaded/cached at: {downloaded_path}")
-    return downloaded_path
+    if not has_weights:
+        raise RuntimeError(
+            f"No model weights found in {LOCAL_MODEL_DIR}\n"
+            f"Please re-run: python setup_models.py"
+        )
 
 
-def _load_model():
-    """Lazy-load the model on first use, so importing this file doesn't
-    immediately trigger a download/load if it's not needed yet."""
-    global _llm
+def _load_model() -> None:
+    """Lazy-load the transformers model on first use."""
+    global _model, _tokenizer
+    if _model is not None and _tokenizer is not None:
+        return
 
-    if _llm is not None:
-        return  # already loaded
-
-    with _llm_lock:
-        if _llm is not None:
+    with _model_lock:
+        if _model is not None and _tokenizer is not None:
             return
 
-        model_path = _resolve_model_path()
+        _verify_model_download()
 
-        logger.info(f"Loading N-ATLaS from {model_path} ...")
-        _llm = Llama(
-            model_path=model_path,
-            n_ctx=N_CTX,
-            n_threads=N_THREADS,
-            n_gpu_layers=N_GPU_LAYERS,
-            verbose=False,
-        )
-        logger.info("N-ATLaS loaded successfully.")
+        logger.info("Loading N-ATLaS tokenizer from %s ...", LOCAL_MODEL_DIR)
+        _tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_DIR, trust_remote_code=True)
+        if _tokenizer.pad_token is None:
+            _tokenizer.pad_token = _tokenizer.eos_token
+
+        logger.info("Loading N-ATLaS model... This may take 2–5 minutes on first load.")
+
+        # Try GPU first, fall back to CPU if OOM
+        load_errors = []
+
+        if torch.cuda.is_available():
+            try:
+                logger.info("Attempting GPU load with 4-bit quantization...")
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+                _model = AutoModelForCausalLM.from_pretrained(
+                    LOCAL_MODEL_DIR,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=torch.float16,
+                )
+                logger.info("✓ N-ATLaS loaded on GPU with 4-bit quantization.")
+                return
+            except Exception as e:
+                load_errors.append(f"GPU 4-bit failed: {e}")
+                logger.warning("GPU 4-bit load failed: %s", e)
+
+                # Clear GPU cache before retry
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                try:
+                    logger.info("Retrying GPU with 8-bit quantization...")
+                    bnb_config_8bit = BitsAndBytesConfig(load_in_8bit=True)
+                    _model = AutoModelForCausalLM.from_pretrained(
+                        LOCAL_MODEL_DIR,
+                        quantization_config=bnb_config_8bit,
+                        device_map="auto",
+                        trust_remote_code=True,
+                        low_cpu_mem_usage=True,
+                    )
+                    logger.info("✓ N-ATLaS loaded on GPU with 8-bit quantization.")
+                    return
+                except Exception as e2:
+                    load_errors.append(f"GPU 8-bit failed: {e2}")
+                    logger.warning("GPU 8-bit load failed: %s", e2)
+                    torch.cuda.empty_cache()
+
+        # Fallback to CPU
+        try:
+            logger.warning("Falling back to CPU load (slower but more stable)...")
+            _model = AutoModelForCausalLM.from_pretrained(
+                LOCAL_MODEL_DIR,
+                device_map="cpu",
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+            )
+            logger.info("✓ N-ATLaS loaded on CPU.")
+        except Exception as e:
+            load_errors.append(f"CPU failed: {e}")
+            logger.error("All model loading attempts failed:")
+            for err in load_errors:
+                logger.error("  - %s", err)
+            raise RuntimeError(
+                f"Failed to load N-ATLaS model. Tried GPU (4-bit, 8-bit) and CPU.\n"
+                f"Last error: {e}\n"
+                f"If on Colab free tier, the model may be too large. "
+                f"Consider using a smaller model or upgrading to Colab Pro."
+            )
 
 
-def get_llm() -> Llama:
-    """Return the shared local Llama instance, loading it if needed.
-
-    extract_keywords.py calls this too, so only one copy of N-ATLaS is
-    ever resident in RAM at a time.
-    """
+def get_model() -> tuple[AutoModelForCausalLM, AutoTokenizer]:
+    """Return the shared (model, tokenizer) tuple."""
     _load_model()
-    return _llm
+    if _model is None or _tokenizer is None:
+        raise RuntimeError("Failed to load N-ATLaS model")
+    return _model, _tokenizer
+
+
+def generate_text(
+    prompt: str,
+    max_new_tokens: int = 750,
+    temperature: float = 0.3,
+) -> str:
+    """
+    Generate text using the loaded N-ATLaS model.
+    NEVER returns an empty string — raises RuntimeError if empty.
+    """
+    model, tokenizer = get_model()
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=N_CTX,
+    )
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=0.9,
+            do_sample=True,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    input_len = inputs["input_ids"].shape[1]
+    generated_tokens = outputs[0][input_len:]
+    text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+    if not text:
+        raise RuntimeError("LLM returned an empty response — possible generation failure.")
+
+    return text
 
 
 # ============================================================================
@@ -122,51 +209,24 @@ STRUCTURE_PROMPT = """You are a clinical note assistant specializing in multilin
 
 {language_context}
 
-Your task: Take a patient's raw speech (in Yoruba, Igbo, Hausa, or English)
-and write it up as a clear, descriptive English clinical note — the way a
-doctor would document it in a patient's chart, not a clipped summary.
+Your task: Take a patient's raw speech and write it up as a clear, descriptive English clinical note — the way a doctor would document it in a patient's chart, not a clipped summary.
 
 INSTRUCTIONS:
 1. If the patient spoke in Yoruba, Igbo, or Hausa, translate their meaning into clear, natural English.
 2. Write and organize EXACTLY these five fields:
 
    FIELDS 1-4 — GROUNDED IN ONLY WHAT THE PATIENT SAID:
-   - chief_complaint: Describe the patient's main symptom or concern in detail —
-     what it is, where it's located if mentioned, how it feels if described
-     (sharp, dull, constant, comes and goes, etc.). Write 2-4 full sentences,
-     weaving together everything the patient said about their main problem.
-   - duration: Describe the timeline in full — when it started, whether it's
-     gotten better/worse/stayed the same, if the patient mentioned any pattern.
-     Write in a full sentence, not just a short phrase.
-   - severity: Describe how the patient characterized the severity, including
-     any impact they mentioned (e.g. "unable to sleep", "can't eat"). State
-     the overall level (mild, moderate, or severe) but explain the reasoning
-     in a full sentence, not just the single word.
-   - history: Write a full paragraph covering any secondary symptoms, prior
-     episodes, medications already tried, or other relevant context the
-     patient mentioned — even in passing.
+   - chief_complaint: Describe the patient's main symptom or concern in detail.
+   - duration: Describe the timeline in full.
+   - severity: Describe how the patient characterized the severity.
+   - history: Write a full paragraph covering any secondary symptoms, prior episodes, medications already tried, or other relevant context.
 
    FIELD 5 — MAY REASON BEYOND THE LITERAL STATEMENT, BUT STAY CONSERVATIVE:
-   - possible_recommendations: Offer gentle, general considerations for the
-     doctor — possible related causes or categories worth exploring, and any
-     general next-step suggestions. This is a NUDGE for the doctor to consider,
-     NOT a diagnosis and NOT a ranked differential. Do not assert likelihood
-     or probability. Do not say a condition is likely, probable, or confirmed.
-     Phrase everything as open possibilities (e.g. "may be worth considering",
-     "could be related to", "the doctor may wish to evaluate for"). Keep this
-     brief — 2-3 sentences. If the symptoms are too vague or general to suggest
-     anything responsibly, write "No specific considerations suggested — insufficient detail."
+   - possible_recommendations: Offer gentle, general considerations for the doctor. This is a NUDGE, NOT a diagnosis. Phrase everything as open possibilities. Keep this brief — 2-3 sentences. If too vague, write "No specific considerations suggested — insufficient detail."
 
-3. ABSOLUTE RULE FOR FIELDS 1-4 — DO NOT HALLUCINATE: Every sentence in
-   chief_complaint, duration, severity, and history must be traceable to
-   something the patient actually said. "More descriptive" means fully
-   expressing what they said in complete, natural clinical language — NOT
-   adding new symptoms, causes, timelines, or details they never mentioned.
-4. If a field truly was not mentioned at all, write "Not mentioned by patient"
-   rather than guessing or filling in a plausible-sounding detail.
-5. Fields 1-4 must not contain clinical interpretations, diagnoses, or
-   assumptions the patient did not state — that reasoning belongs ONLY in
-   possible_recommendations, and even there, must stay conservative and hedged.
+3. ABSOLUTE RULE FOR FIELDS 1-4 — DO NOT HALLUCINATE: Every sentence must be traceable to something the patient actually said.
+4. If a field was not mentioned, write "Not mentioned by patient".
+5. Fields 1-4 must not contain clinical interpretations or diagnoses.
 6. Respond with ONLY valid JSON. No explanatory text before or after the JSON.
 
 EXAMPLE:
@@ -174,10 +234,10 @@ Patient speech: "My stomach has been hurting me since yesterday, I've been vomit
 Output:
 {{
   "chief_complaint": "The patient reports abdominal pain accompanied by vomiting. The pain is significant enough that the patient has been unable to eat since symptoms began.",
-  "duration": "Symptoms began yesterday and have persisted since onset. The patient did not specify whether the pain has changed in intensity over this period.",
+  "duration": "Symptoms began yesterday and have persisted since onset.",
   "severity": "The patient describes the pain as very bad, and it has been severe enough to prevent normal eating, indicating a severe presentation.",
   "history": "Not mentioned by patient.",
-  "possible_recommendations": "Given the combination of abdominal pain and vomiting, general gastrointestinal causes may be worth considering, though this is not exhaustive. The doctor may wish to evaluate hydration status given the reported inability to eat."
+  "possible_recommendations": "Given the combination of abdominal pain and vomiting, general gastrointestinal causes may be worth considering. The doctor may wish to evaluate hydration status."
 }}
 
 Now process this patient's speech:
@@ -187,70 +247,65 @@ Output (JSON only, no other text):"""
 
 
 # ============================================================================
-# LLM CALLING
-# ============================================================================
-
-def call_natlas_llm(prompt: str, max_new_tokens: int = 750) -> str:
-    """Generate text using the locally loaded N-ATLaS model."""
-    llm = get_llm()
-
-    result = llm.create_completion(
-        prompt,
-        max_tokens=max_new_tokens,
-        temperature=0.3,   # low temp = consistent structured output
-        top_p=0.9,
-    )
-
-    return result["choices"][0]["text"].strip()
-
-
-# ============================================================================
 # JSON PARSING & VALIDATION
 # ============================================================================
 
-def extract_json_from_text(text: str):
-    """Pull a JSON object out of text that may include markdown fences or extra words."""
+def _extract_json_from_text(text: str) -> str | None:
     cleaned = text.replace("```json", "").replace("```", "").strip()
-    match = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', cleaned, re.DOTALL)
-    if match:
-        return match.group(0)
-    if cleaned.startswith("{"):
-        return cleaned
+    start = cleaned.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i, ch in enumerate(cleaned[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start : i + 1]
     return None
 
 
-def validate_structure(data: dict) -> dict:
-    """Ensure all required fields exist; fill missing ones with defaults."""
-    required_fields = ["chief_complaint", "duration", "severity", "history"]
-    for field in required_fields:
+def _validate_structure(data: dict) -> dict:
+    required = ["chief_complaint", "duration", "severity", "history"]
+    for field in required:
         if field not in data or not data[field]:
-            data[field] = "Not mentioned"
+            data[field] = "Not mentioned by patient"
     if "possible_recommendations" not in data or not data["possible_recommendations"]:
         data["possible_recommendations"] = "No specific considerations suggested — insufficient detail."
     return data
 
 
-def parse_llm_output(raw_output: str) -> dict:
-    """Extract, parse, and validate the JSON clinical note from raw LLM text."""
+def _parse_llm_output(raw_output: str) -> dict:
     if not raw_output:
-        return {"chief_complaint": "", "duration": "", "severity": "", "history": "", "possible_recommendations": "",
-                "_error": "Empty LLM output"}
+        return _error_result("Empty LLM output")
 
-    json_str = extract_json_from_text(raw_output)
+    json_str = _extract_json_from_text(raw_output)
     if not json_str:
         logger.warning("No JSON found in LLM output")
-        return {"chief_complaint": "", "duration": "", "severity": "", "history": "", "possible_recommendations": "",
-                "_error": "No JSON in output", "_raw": raw_output[:200]}
+        return _error_result("No JSON in output", raw_output[:500])
 
     try:
         data = json.loads(json_str)
         if not isinstance(data, dict):
             raise ValueError("Parsed JSON is not a dictionary")
-        return validate_structure(data)
+        return _validate_structure(data)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}")
-        return {"chief_complaint": "", "duration": "", "severity": "", "history": "", "possible_recommendations": "",
-                "_error": f"JSON parse failed: {str(e)}", "_raw": json_str[:200]}
+        logger.error("JSON decode error: %s", e)
+        return _error_result(f"JSON parse failed: {e}", json_str[:500])
+
+
+def _error_result(msg: str, raw: str = "") -> dict:
+    return {
+        "chief_complaint": "",
+        "duration": "",
+        "severity": "",
+        "history": "",
+        "possible_recommendations": "",
+        "_error": msg,
+        "_raw": raw,
+    }
 
 
 # ============================================================================
@@ -258,45 +313,43 @@ def parse_llm_output(raw_output: str) -> dict:
 # ============================================================================
 
 def structure_note(transcript: str, language_context: str = "") -> dict:
-    """
-    Main function: Convert raw patient transcript -> structured clinical note.
-
-    Args:
-        transcript: Patient's raw speech (Yoruba/Igbo/Hausa/English)
-        language_context: Optional context string from the audio-based
-            language detection stage (nlp/audio_language_detect.py), run
-            BEFORE ASR on the raw audio. Passing this in means N-ATLaS
-            doesn't have to figure out the language situation itself.
-
-    Returns:
-        Dict with chief_complaint, duration, severity, history,
-        possible_recommendations (all English).
-        May include _error / _raw keys if something went wrong.
-    """
-    if not transcript or len(transcript.strip()) == 0:
+    if not transcript or not transcript.strip():
         logger.warning("Empty transcript provided")
-        return {"chief_complaint": "", "duration": "", "severity": "", "history": "", "possible_recommendations": "",
-                "_error": "Empty transcript"}
+        return _error_result("Empty transcript")
 
-    logger.info(f"Structuring note from transcript: {transcript[:50]}...")
+    logger.info("Structuring note from transcript: %s...", transcript[:60])
 
     prompt = STRUCTURE_PROMPT.format(
-        transcript=transcript,
-        language_context=language_context or "Language: not pre-detected — determine from the transcript itself."
+        transcript=transcript.strip(),
+        language_context=language_context
+        or "Language: not pre-detected — determine from the transcript itself.",
     )
 
-    try:
-        raw_output = call_natlas_llm(prompt)
-    except Exception as e:
-        logger.error(f"LLM call failed: {e}")
-        return {"chief_complaint": "", "duration": "", "severity": "", "history": "", "possible_recommendations": "",
-                "_error": f"LLM call failed: {str(e)}"}
+    last_error = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            raw_output = generate_text(prompt, max_new_tokens=750, temperature=0.1)
+            structured = _parse_llm_output(raw_output)
 
-    structured = parse_llm_output(raw_output)
-    logger.info("Note structuring complete")
-    return structured
+            if "_error" in structured:
+                last_error = structured["_error"]
+                logger.warning("Attempt %d: parse error — %s", attempt, last_error)
+                continue
+
+            main_fields = [structured.get(f, "") for f in ["chief_complaint", "duration", "severity", "history"]]
+            if all(f in ("", "Not mentioned by patient") for f in main_fields):
+                raise RuntimeError("All clinical fields are empty after structuring")
+
+            logger.info("Note structuring complete (attempt %d)", attempt)
+            return structured
+
+        except Exception as e:
+            last_error = str(e)
+            logger.exception("LLM call failed (attempt %d)", attempt)
+
+    logger.error("All %d attempts failed. Last error: %s", MAX_RETRIES, last_error)
+    return _error_result(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
 
 
-def structure_note_batch(transcripts: list) -> list:
-    """Process multiple transcripts (useful for testing)."""
-    return [structure_note(t) for t in transcripts]
+def structure_note_batch(transcripts: list[tuple[str, str]]) -> list[dict]:
+    return [structure_note(t, ctx) for t, ctx in transcripts]
