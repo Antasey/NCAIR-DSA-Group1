@@ -2,7 +2,7 @@
 
 ## What This Is
 
-The Gradio entry point for NCAIR-DSA. Runs the full pipeline live: audio capture → language detection → ASR → N-ATLaS structuring → keyword extraction → doctor review → database save → export. This is what your team runs in Colab to get a public demo link.
+The Gradio entry point for MediVoice. Runs the full pipeline live: audio capture → language detection → ASR → N-ATLaS structuring → keyword extraction → doctor review → database save → export. This is what your team runs in Colab to get a public demo link.
 
 ---
 
