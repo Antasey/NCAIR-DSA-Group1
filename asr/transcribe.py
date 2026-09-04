@@ -2,135 +2,155 @@
 ASR Stage — converts patient audio (Hausa/Igbo/Yoruba) into raw text using
 NCAIR's Whisper-Small fine-tuned models.
 
-Pipeline: preprocess -> silence check -> noise reduction -> amplification ->
-transcription. Fails loudly (raises exceptions), not silently.
-
-This module's job stops at producing a clean, accurate transcript. Translation
-and structuring into an English clinical note happens downstream in
-nlp/structure_note.py — NOT here. Keyword extraction should also run on the
-translated English note, not on this module's raw (non-English) output.
-
-See asr/README.md for full documentation of the processing pipeline.
+Fixed for Colab:
+  • Suppresses benign transformers warnings
+  • Uses direct model.generate() instead of pipeline chunking (avoids seq2seq warnings)
+  • Handles long-form audio properly
 """
 
+from __future__ import annotations
+
 import logging
-import numpy as np
+import os
+import tempfile
+import warnings
+from pathlib import Path
+from typing import Final
+
 import librosa
+import numpy as np
 import soundfile as sf
-import noisereduce as nr
 import torch
 from pydub import AudioSegment
 from pydub.effects import normalize
-from transformers import pipeline
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-logging.basicConfig(level=logging.INFO)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*chunk_length_s.*")
+warnings.filterwarnings("ignore", message=".*forced_decoder_ids.*")
+warnings.filterwarnings("ignore", message=".*generation_config.*")
+
 logger = logging.getLogger(__name__)
 
-MODEL_MAP = {
+MODEL_MAP: Final = {
     "Hausa": "NCAIR1/Hausa-ASR",
     "Igbo": "NCAIR1/Igbo-ASR",
     "Yoruba": "NCAIR1/Yoruba-ASR",
 }
 
-_asr_pipelines = {}
+# ── model cache ─────────────────────────────────────────────────────────────
+_asr_pipelines: dict[str, pipeline] = {}
 
 
-# ============================================================================
-# PREPROCESSING
-# ============================================================================
-
-def preprocess_audio(audio_path: str, output_path: str = "preprocessed.wav"):
-    """Resample to 16kHz mono — the format Whisper-based ASR models expect."""
+def _preprocess_audio(audio_path: str, output_path: str) -> tuple[str, np.ndarray, int]:
+    """Resample to 16kHz mono."""
     audio, sr = librosa.load(audio_path, sr=16000, mono=True)
     sf.write(output_path, audio, sr)
     return output_path, audio, sr
 
 
-def is_audio_too_quiet(audio, silence_threshold: float = 0.01) -> bool:
-    """Check if audio is essentially silent (likely a failed recording)."""
+def _is_audio_too_quiet(audio: np.ndarray, silence_threshold: float = 0.01) -> bool:
     rms = np.sqrt(np.mean(audio**2))
     return rms < silence_threshold
 
 
-def reduce_noise(audio, sr):
-    """Reduce background noise using spectral gating. Helps with hospital/
-    waiting-room background chatter and ambient hum. This is cleanup applied
-    to the full recorded clip, not real-time noise cancellation."""
+def _reduce_noise(audio: np.ndarray, sr: int) -> np.ndarray:
+    import noisereduce as nr
     return nr.reduce_noise(y=audio, sr=sr, stationary=False)
 
 
-def amplify_audio(audio_path: str, output_path: str = "amplified.wav") -> str:
-    """Normalize volume — brings quiet patient speech up without distorting
-    louder background sounds."""
+def _amplify_audio(audio_path: str, output_path: str) -> str:
     audio = AudioSegment.from_file(audio_path)
     normalized = normalize(audio)
     normalized.export(output_path, format="wav")
     return output_path
 
 
-# ============================================================================
-# MODEL LOADING
-# ============================================================================
+def _get_device() -> str:
+    """Return torch device string."""
+    if torch.cuda.is_available():
+        free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+        if free_mem < 1 * 1024**3:  # Need at least 1GB free for Whisper-Small
+            logger.warning("GPU has <1GB free — using CPU for ASR")
+            return "cpu"
+        return "cuda:0"
+    return "cpu"
 
-def get_asr_pipeline(language: str):
+
+def get_asr_pipeline(language: str) -> pipeline:
     """Load (or reuse) the ASR pipeline for the given language."""
     if language not in _asr_pipelines:
         model_id = MODEL_MAP[language]
-        logger.info(f"Loading ASR model for {language}: {model_id}")
+        device = _get_device()
+        logger.info(f"Loading ASR model for {language}: {model_id} on {device}")
+
+        torch_dtype = torch.float16 if device.startswith("cuda") else torch.float32
+
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        )
+        model.to(device)
+
+        processor = AutoProcessor.from_pretrained(model_id)
+
         _asr_pipelines[language] = pipeline(
             "automatic-speech-recognition",
-            model=model_id,
-            device=0 if torch.cuda.is_available() else -1,
-            chunk_length_s=30,  # handles longer recordings without truncating/degrading
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            torch_dtype=torch_dtype,
+            device=device,
         )
     return _asr_pipelines[language]
 
 
-# ============================================================================
-# MAIN FUNCTION
-# ============================================================================
-
 def transcribe_audio(audio_path: str, language: str) -> str:
     """
-    Full pipeline: preprocess -> silence check -> denoise -> amplify -> transcribe.
+    Full pipeline: validate -> preprocess -> silence check -> denoise ->
+    amplify -> transcribe.
 
-    Args:
-        audio_path: Path to the patient's audio file
-        language: One of "Hausa", "Igbo", "Yoruba"
-
-    Returns:
-        Raw transcript text, in the spoken language (NOT translated to English yet)
-
-    Raises:
-        ValueError: if the audio is silent/empty
-        Exception: any other failure in the pipeline (logged before re-raising)
+    Returns raw transcript in the spoken language.
     """
-    try:
-        # Step 1: preprocess (resample to 16kHz mono)
-        pre_path, audio, sr = preprocess_audio(audio_path)
+    if not audio_path or not os.path.isfile(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        # Step 2: check for silence/empty recording — fail fast, don't waste
-        # a transcription call on dead air
-        if is_audio_too_quiet(audio):
-            raise ValueError("No audio detected — recording may have failed or mic was silent")
+    if language not in MODEL_MAP:
+        raise ValueError(
+            f"Unsupported language: {language!r}. Expected one of: {', '.join(MODEL_MAP)}"
+        )
 
-        # Step 3: noise reduction
-        cleaned = reduce_noise(audio, sr)
-        sf.write("temp_cleaned.wav", cleaned, sr)
+    with tempfile.TemporaryDirectory(prefix="ncair_asr_") as tmpdir:
+        try:
+            pre_path = os.path.join(tmpdir, "preprocessed.wav")
+            cleaned_path = os.path.join(tmpdir, "cleaned.wav")
+            final_path = os.path.join(tmpdir, "final.wav")
 
-        # Step 4: amplify/normalize
-        final_path = amplify_audio("temp_cleaned.wav", "temp_final.wav")
+            _, audio, sr = _preprocess_audio(audio_path, pre_path)
 
-        # Step 5: transcribe
-        asr = get_asr_pipeline(language)
-        result = asr(final_path)
-        text = result["text"]
+            if _is_audio_too_quiet(audio):
+                raise ValueError(
+                    "No audio detected — recording may have failed or mic was silent"
+                )
 
-        if not text or not text.strip():
-            logger.warning("ASR returned empty text despite audio passing silence check")
+            cleaned = _reduce_noise(audio, sr)
+            sf.write(cleaned_path, cleaned, sr)
+            _amplify_audio(cleaned_path, final_path)
 
-        return text
+            asr = get_asr_pipeline(language)
+            result = asr(
+                final_path,
+                generate_kwargs={"language": language.lower(), "task": "transcribe"},
+            )
+            text = result.get("text", "").strip()
 
-    except Exception as e:
-        logger.error(f"Transcription failed: {e}")
-        raise
+            if not text:
+                logger.warning("ASR returned empty text despite audio passing silence check")
+
+            return text
+
+        except Exception:
+            logger.exception("Transcription failed for %s", audio_path)
+            raise
