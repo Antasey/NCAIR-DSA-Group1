@@ -202,7 +202,7 @@ Tests cover:
 | Name | Role |
 |---|---|
 | **Confidence Martins Aweh** | Team Member |
-| **Deborah Tony-Owakah** | Team Member |
+| **Deborah Tony-Owakah** | Group Leader |
 | **Favour Oseghale** | Team Member |
 | **Jesutomi Santa** | Team Member |
 | **Oluwafikolami Ejidare** | Team Member |
