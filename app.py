@@ -1,25 +1,17 @@
 """
 MediVoice — Multi-Lingual Patient Intake Assistant (Gradio / hosted version)
 
-Refactored for:
-  • Lower latency (caching, eliminated redundant work, batched DB ops)
-  • Fewer bugs (state cleanup, input validation, safer parameter passing)
-  • Better UX (auto-navigation, loading states, double-click guards)
-  • Cleaner architecture (separated rendering from data, TTL cache, type hints)
-
-Screen flow (mirrors the desktop app):
-    Dashboard (landing) --"New Intake"--> role picker
-        --Nurse--> Nurse capture flow
-        --Doctor--> Patients queue (same destination as the sidebar link)
-    Patients (sidebar) --"Review"--> Doctor review screen --"Confirm & Finalize"--> back to queue
-
-Run with: python app.py
-Expects nlp/, asr/, templates/ as sibling folders.
+With:
+  • Loading/processing indicators on all heavy operations
+  • Confirmation messages after save with "Return to Dashboard" action
+  • Back-to-Dashboard on every page
+  • Transformers-based N-ATLaS (run `python setup_models.py` first)
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -28,9 +20,18 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import gradio as gr
+
+# ── pre-flight model check ──────────────────────────────────────────────────
+MODEL_DIR = Path("models/N-ATLaS")
+if not MODEL_DIR.exists():
+    raise RuntimeError(
+        f"N-ATLaS model not found at {MODEL_DIR}.\n"
+        f"Please run first:  python setup_models.py"
+    )
 
 # ── path setup ──────────────────────────────────────────────────────────────
 _BASE = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +41,10 @@ for sub in ("nlp", "asr", "templates"):
         sys.path.insert(0, p)
 
 import clinical_note as db  # noqa: E402
+
+# ── logging ─────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 # ── constants ───────────────────────────────────────────────────────────────
 LANGUAGES = ["Hausa", "Igbo", "Yoruba"]
@@ -85,17 +90,19 @@ CUSTOM_CSS = f"""
 .disclaimer {{ color: {COLOR_WARNING}; font-size: 12px; }}
 .status-ok {{ color: {COLOR_SUCCESS}; }}
 .status-err {{ color: {COLOR_DANGER}; }}
+.status-warn {{ color: {COLOR_WARNING}; }}
 .queue-row {{ background: {COLOR_WHITE}; border: 1px solid {COLOR_CARD_BORDER}; border-radius: 14px;
               padding: 14px 20px; margin-bottom: 8px; }}
 #primary-btn {{ background: {COLOR_TEAL} !important; color: {COLOR_WHITE} !important; border: none !important; }}
 #primary-btn:hover {{ background: {COLOR_TEAL_HOVER} !important; }}
 #primary-btn:disabled {{ background: #9CA3AF !important; cursor: not-allowed !important; }}
+.preview-card {{ background: {COLOR_TEAL_LIGHT}; border: 1px solid {COLOR_TEAL}; border-radius: 14px; padding: 16px; margin-top: 12px; }}
+.confirm-banner {{ background: {COLOR_TEAL_LIGHT}; border-left: 4px solid {COLOR_TEAL}; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }}
+.processing-spinner {{ color: {COLOR_TEAL}; font-size: 14px; font-weight: 600; }}
 """
 
-# ── simple TTL cache ────────────────────────────────────────────────────────
+# ── simple TTL cache ──────────────────────────────────────────────────────
 class _TTLCache:
-    """Thread-safe TTL cache for expensive DB calls."""
-
     def __init__(self, ttl_seconds: float = 5.0):
         self._store: dict[str, tuple[Any, float]] = {}
         self._lock = threading.Lock()
@@ -279,7 +286,6 @@ def extract_visit_id(choice_label: str | None) -> int | None:
 
 
 def _validate_patient_id(pid: str | None) -> tuple[bool, str]:
-    """Returns (is_valid, error_message)."""
     if not pid or not pid.strip():
         return False, "✗ Please enter a Patient ID before processing."
     pid_clean = pid.strip()
@@ -291,7 +297,6 @@ def _validate_patient_id(pid: str | None) -> tuple[bool, str]:
 
 
 def _note_to_text(note: dict) -> str:
-    """Flatten a structured note dict into a single text for keyword extraction."""
     parts = [
         note.get("chief_complaint", ""),
         note.get("duration", ""),
@@ -301,9 +306,37 @@ def _note_to_text(note: dict) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _format_nurse_preview(note: dict, transcript: str) -> str:
+    chief = note.get("chief_complaint", "") or "Not mentioned"
+    duration = note.get("duration", "") or "Not mentioned"
+    severity = note.get("severity", "") or "Not mentioned"
+    history = note.get("history", "") or "Not mentioned"
+
+    return f"""<div class="preview-card">
+      <div style="font-weight:700; color:{COLOR_TEAL}; font-size:14px; margin-bottom:10px;">📝 English Clinical Note Preview</div>
+      <div style="margin-bottom:8px;"><b style="color:{COLOR_TEXT_DARK};">Chief Complaint:</b> <span style="color:{COLOR_TEXT_BODY};">{chief}</span></div>
+      <div style="margin-bottom:8px;"><b style="color:{COLOR_TEXT_DARK};">Duration:</b> <span style="color:{COLOR_TEXT_BODY};">{duration}</span></div>
+      <div style="margin-bottom:8px;"><b style="color:{COLOR_TEXT_DARK};">Severity:</b> <span style="color:{COLOR_TEXT_BODY};">{severity}</span></div>
+      <div style="margin-bottom:8px;"><b style="color:{COLOR_TEXT_DARK};">History:</b> <span style="color:{COLOR_TEXT_BODY};">{history}</span></div>
+      <div style="margin-top:10px; padding-top:10px; border-top:1px dashed {COLOR_CARD_BORDER};">
+        <b style="color:{COLOR_TEXT_DARK};">Original Transcript:</b>
+        <div style="color:{COLOR_TEXT_MUTED}; font-size:12px; margin-top:4px; font-style:italic;">{transcript or "No transcript available."}</div>
+      </div>
+    </div>"""
+
+
+def _format_confirm_banner(patient_id: str, visit_id: int) -> str:
+    return f"""<div class="confirm-banner">
+      <div style="color:{COLOR_TEAL}; font-weight:700; font-size:14px;">✓ Visit Saved Successfully</div>
+      <div style="color:{COLOR_TEXT_BODY}; font-size:13px; margin-top:4px;">
+        Patient <b>{patient_id}</b>'s visit (#{visit_id}) has been saved and is now awaiting doctor review.
+        Would you like to return to the Dashboard?
+      </div>
+    </div>"""
+
+
 # ── backend actions ──────────────────────────────────────────────────────────
 def run_language_detection(audio_path: str | None) -> tuple[gr.update, str, DetectionResult | None]:
-    """Returns (language_dropdown_update, status_markdown, detection_result)."""
     if not audio_path:
         return gr.update(), "", None
 
@@ -330,9 +363,7 @@ def run_language_detection(audio_path: str | None) -> tuple[gr.update, str, Dete
         lang_update = gr.update()
 
     if dr.is_code_switched and dr.code_switch_candidates:
-        candidates = ", ".join(
-            f"{lang} ({prob:.0%})" for lang, prob in dr.code_switch_candidates
-        )
+        candidates = ", ".join(f"{lang} ({prob:.0%})" for lang, prob in dr.code_switch_candidates)
         msg += f"\n⚠ Possible code-switching detected: {candidates}. Processing will continue."
 
     return lang_update, msg, dr
@@ -343,46 +374,56 @@ def process_intake(
     language: str,
     audio_path: str | None,
     detection_result: DetectionResult | None,
-) -> tuple[str, str, str, gr.update]:
+) -> tuple:
     """
     Returns:
-        (status_markdown, dash_stats_html, dash_activity_html, page_visibility_update)
+        (status, dash_stats, dash_activity, preview_visible, preview_html,
+         chief, duration, severity, history, transcript, confirm_visible, confirm_html)
     """
-    # ── validation ──────────────────────────────────────────────────────────
     valid, msg_or_pid = _validate_patient_id(patient_id)
     if not valid:
-        return msg_or_pid, *render_dashboard(), gr.update(visible=False)
+        return msg_or_pid, *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), ""
 
     if not audio_path:
-        return "✗ Please provide patient audio before processing.", *render_dashboard(), gr.update(visible=False)
+        return "✗ Please provide patient audio before processing.", *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), ""
 
     if language not in LANGUAGES:
-        return f"✗ Unsupported language: {language}.", *render_dashboard(), gr.update(visible=False)
+        return f"✗ Unsupported language: {language}.", *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), ""
 
-    # ── processing ──────────────────────────────────────────────────────────
     try:
         from transcribe import transcribe_audio
         from structure_note import structure_note
         from extract_keywords import extract_keywords
+        from audio_language_detect import detect_audio_language
 
-        # 1. Transcribe (the heavy lift)
         transcript = transcribe_audio(audio_path, language)
         if not transcript or not transcript.strip():
-            return "✗ Transcription returned empty. Please check audio quality and try again.", *render_dashboard(), gr.update(visible=False)
+            return (
+                "✗ Transcription returned empty. Please check audio quality and try again.",
+                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), "",
+            )
 
-        # 2. Structure note — use cached detection context if available
         language_context = detection_result.context_note if detection_result else ""
         try:
-            # Try with context; fall back to without if the function doesn't support it
             note = structure_note(transcript, language_context=language_context)
         except TypeError:
             note = structure_note(transcript)
 
-        # 3. Extract keywords from the ENGLISH structured note (not raw transcript)
+        if "_error" in note:
+            return (
+                f"✗ Clinical note generation failed: {note['_error']}",
+                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), "",
+            )
+
+        if not note.get("chief_complaint"):
+            return (
+                "✗ The AI returned an empty clinical note. Please try again with clearer audio.",
+                *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), "",
+            )
+
         note_text = _note_to_text(note)
         keywords = extract_keywords(note_text)
 
-        # 4. Save to DB
         visit_id = db.save_patient_record(
             patient_id=msg_or_pid,
             chief_complaint=note.get("chief_complaint", ""),
@@ -396,18 +437,28 @@ def process_intake(
         )
 
         status = f"✓ Saved. Patient {msg_or_pid}'s visit (#{visit_id}) is now awaiting doctor review."
+        preview_html = _format_nurse_preview(note, transcript)
+        confirm_html = _format_confirm_banner(msg_or_pid, visit_id)
 
-        # invalidate caches so next render picks up the new visit
         _cache.invalidate("dashboard")
         _cache.invalidate("queue")
 
     except Exception as e:
         traceback.print_exc()
-        status = f"✗ Error during processing: {e}"
-        return status, *render_dashboard(), gr.update(visible=False)
+        logger.error("Intake processing failed: %s", e)
+        return (
+            f"✗ Error during processing: {e}",
+            *render_dashboard(), gr.update(visible=False), "", "", "", "", "", gr.update(visible=False), "",
+        )
 
     stat_html, activity_html = render_dashboard()
-    return status, stat_html, activity_html, gr.update(visible=True)
+    return (
+        status, stat_html, activity_html,
+        gr.update(visible=True), preview_html,
+        note.get("chief_complaint", ""), note.get("duration", ""),
+        note.get("severity", ""), note.get("history", ""), transcript,
+        gr.update(visible=True), confirm_html,
+    )
 
 
 def load_review(choice_label: str | None) -> tuple:
@@ -442,20 +493,17 @@ def load_review(choice_label: str | None) -> tuple:
             None,
         )
 
-    (v_id, patient_id, chief_complaint, duration, severity, history,
-     recommendations, language, keywords_json, transcript, status, created_at) = visit
-
-    header = f"Patient {patient_id} · {language} · Visit #{v_id} · {created_at}"
+    header = f"Patient {visit['patient_id']} · {visit['language']} · Visit #{visit['visit_id']} · {visit['created_at']}"
     return (
         header,
-        chief_complaint or "",
-        duration or "",
-        severity or "",
-        history or "",
-        recommendations or "",
-        format_keywords(keywords_json),
-        transcript or "",
-        gr.update(value=""),  # clear review status
+        visit["chief_complaint"] or "",
+        visit["duration"] or "",
+        visit["severity"] or "",
+        visit["history"] or "",
+        visit["possible_recommendations"] or "",
+        format_keywords(visit["extracted_keywords"]),
+        visit["raw_transcript"] or "",
+        gr.update(value=""),
         visit_id,
     )
 
@@ -504,7 +552,6 @@ PAGE_NAMES = ["dashboard", "role", "intake", "queue", "review"]
 
 
 def goto(page_name: str) -> list[gr.update]:
-    """Return visibility updates for all pages."""
     return [gr.update(visible=(name == page_name)) for name in PAGE_NAMES]
 
 
@@ -521,12 +568,11 @@ def refresh_queue() -> tuple[str, gr.update]:
 db.init_db()
 
 with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake Assistant") as demo:
-    # ── shared state ────────────────────────────────────────────────────────
     visit_id_state = gr.State(None)
-    detection_state = gr.State(None)   # DetectionResult | None
+    detection_state = gr.State(None)
 
-    # ── sidebar ─────────────────────────────────────────────────────────────
     with gr.Row():
+        # ── sidebar ─────────────────────────────────────────────────────────
         with gr.Column(scale=1, elem_id="sidebar", min_width=240):
             gr.HTML(_sidebar_logo())
             nav_dashboard = gr.Button("🏠  Dashboard", elem_classes=["nav-btn", "active"])
@@ -563,7 +609,7 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
 
             # ---- Nurse intake ----
             with gr.Column(visible=False) as intake_page:
-                back_from_intake = gr.Button("← Back to Dashboard", elem_classes=["nav-btn"])
+                back_from_intake_top = gr.Button("← Back to Dashboard", elem_classes=["nav-btn"])
                 gr.HTML(
                     f'<div style="font-size:24px; font-weight:700; color:{COLOR_TEXT_DARK}; margin-top:8px;">New Patient Intake</div>'
                     f'<div style="color:{COLOR_TEXT_MUTED}; margin-bottom:16px;">Record or upload patient audio to begin.</div>'
@@ -571,31 +617,41 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
                 with gr.Group(elem_classes=["card"]):
                     gr.HTML(f'<b style="color:{COLOR_TEXT_DARK};">Patient Details</b>')
                     with gr.Row():
-                        patient_id_input = gr.Textbox(
-                            label="Patient ID",
-                            placeholder="e.g. P001",
-                            max_lines=1,
-                        )
+                        patient_id_input = gr.Textbox(label="Patient ID", placeholder="e.g. P001", max_lines=1)
                         language_input = gr.Dropdown(
-                            LANGUAGES,
-                            value=LANGUAGES[0],
+                            LANGUAGES, value=LANGUAGES[0],
                             label="Language (auto-detected — confirm or override)",
                         )
                 with gr.Group(elem_classes=["card"]):
                     gr.HTML(f'<b style="color:{COLOR_TEXT_DARK};">Patient Audio</b>')
-                    audio_input = gr.Audio(
-                        sources=["microphone", "upload"],
-                        type="filepath",
-                        label="Record or upload",
-                    )
+                    audio_input = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Record or upload")
                     lang_detect_status = gr.Markdown("")
-                process_btn = gr.Button(
-                    "🔄  Transcribe & Structure Note",
-                    elem_id="primary-btn",
-                )
+                process_btn = gr.Button("🔄  Transcribe & Structure Note", elem_id="primary-btn")
                 intake_status = gr.Markdown("")
-                # hidden component to trigger page switch after success
-                intake_success_trigger = gr.Markdown(visible=False)
+
+                # ── PROCESSING INDICATOR ──
+                processing_indicator = gr.Markdown(visible=False)
+
+                # ── NURSE PREVIEW: English translation + raw transcript ──
+                with gr.Group(visible=False) as nurse_preview_group:
+                    nurse_preview_html = gr.HTML()
+                    with gr.Row():
+                        nurse_chief = gr.Textbox(label="Chief Complaint", interactive=False)
+                        nurse_duration = gr.Textbox(label="Duration", interactive=False)
+                    with gr.Row():
+                        nurse_severity = gr.Textbox(label="Severity", interactive=False)
+                        nurse_history = gr.Textbox(label="History", interactive=False)
+                    nurse_transcript = gr.Textbox(label="Original Transcript", interactive=False, lines=3)
+
+                # ── CONFIRMATION BANNER ──
+                with gr.Group(visible=False) as confirm_group:
+                    confirm_banner_html = gr.HTML()
+                    with gr.Row():
+                        confirm_back_dashboard = gr.Button("🏠  Return to Dashboard", elem_id="primary-btn")
+                        confirm_new_intake = gr.Button("🎙️  Start Another Intake")
+
+                # ── BACK TO DASHBOARD (bottom of page too) ──
+                back_from_intake_bottom = gr.Button("← Back to Dashboard", elem_classes=["nav-btn"])
 
             # ---- Doctor queue ----
             with gr.Column(visible=False) as queue_page:
@@ -605,10 +661,7 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
                     f'<div style="color:{COLOR_TEXT_MUTED}; margin-bottom:16px;">Visits awaiting doctor review, oldest first.</div>'
                 )
                 queue_html = gr.HTML()
-                queue_select = gr.Dropdown(
-                    label="Select a visit to review",
-                    choices=[],
-                )
+                queue_select = gr.Dropdown(label="Select a visit to review", choices=[])
                 review_btn = gr.Button("Review →", elem_id="primary-btn")
 
             # ---- Doctor review ----
@@ -635,7 +688,6 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
                     export_btn = gr.Button("📤  Export Visit as CSV")
                 review_status = gr.Markdown("")
                 export_file = gr.File(label="Download", visible=True)
-                # hidden trigger to auto-return to queue after finalize
                 finalize_trigger = gr.Markdown(visible=False)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -643,49 +695,21 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
     # ═══════════════════════════════════════════════════════════════════════
     all_pages = [dashboard_page, role_page, intake_page, queue_page, review_page]
 
-    # -- sidebar / top-level nav --
-    nav_dashboard.click(
-        lambda: goto("dashboard"),
-        outputs=all_pages,
-    ).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
-
+    nav_dashboard.click(lambda: goto("dashboard"), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
     nav_new_intake.click(lambda: goto("role"), outputs=all_pages)
     start_intake_btn.click(lambda: goto("role"), outputs=all_pages)
+    nav_patients.click(lambda: goto("queue"), outputs=all_pages).then(refresh_queue, outputs=[queue_html, queue_select])
 
-    nav_patients.click(
-        lambda: goto("queue"),
-        outputs=all_pages,
-    ).then(refresh_queue, outputs=[queue_html, queue_select])
-
-    # -- role picker --
     role_nurse_btn.click(lambda: goto("intake"), outputs=all_pages)
-    role_doctor_btn.click(
-        lambda: goto("queue"),
-        outputs=all_pages,
-    ).then(refresh_queue, outputs=[queue_html, queue_select])
-    back_from_role.click(
-        lambda: goto("dashboard"),
-        outputs=all_pages,
-    ).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
-
-    # -- back buttons --
-    back_from_intake.click(
-        lambda: goto("dashboard"),
-        outputs=all_pages,
-    ).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
-
-    back_from_queue.click(
-        lambda: goto("dashboard"),
-        outputs=all_pages,
-    ).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
-
-    back_from_review.click(
-        lambda: goto("queue"),
-        outputs=all_pages,
-    ).then(refresh_queue, outputs=[queue_html, queue_select])
+    role_doctor_btn.click(lambda: goto("queue"), outputs=all_pages).then(refresh_queue, outputs=[queue_html, queue_select])
+    back_from_role.click(lambda: goto("dashboard"), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    back_from_intake_top.click(lambda: goto("dashboard"), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    back_from_intake_bottom.click(lambda: goto("dashboard"), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    back_from_queue.click(lambda: goto("dashboard"), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    back_from_review.click(lambda: goto("queue"), outputs=all_pages).then(refresh_queue, outputs=[queue_html, queue_select])
 
     # ═══════════════════════════════════════════════════════════════════════
-    # NURSE INTAKE WIRING
+    # NURSE INTAKE WIRING — with loading indicator & confirmation
     # ═══════════════════════════════════════════════════════════════════════
     audio_input.change(
         run_language_detection,
@@ -693,26 +717,53 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
         outputs=[language_input, lang_detect_status, detection_state],
     )
 
+    # Step 1: Show "Processing..." and disable button
+    def _show_processing():
+        return (
+            gr.update(value='<div class="processing-spinner">🔄 Processing audio... This may take 30–60 seconds. Please do not close this tab.</div>', visible=True),
+            gr.update(interactive=False),  # disable process button
+        )
+
     process_btn.click(
+        _show_processing,
+        outputs=[processing_indicator, process_btn],
+    ).then(
         process_intake,
         inputs=[patient_id_input, language_input, audio_input, detection_state],
-        outputs=[intake_status, dash_stats_html, dash_activity_html, intake_success_trigger],
-        show_progress="minimal",
+        outputs=[
+            intake_status, dash_stats_html, dash_activity_html,
+            nurse_preview_group, nurse_preview_html,
+            nurse_chief, nurse_duration, nurse_severity, nurse_history, nurse_transcript,
+            confirm_group, confirm_banner_html,
+        ],
+        show_progress="full",
+    ).then(
+        # Re-enable button and hide processing indicator after completion
+        lambda: (gr.update(visible=False), gr.update(interactive=True)),
+        outputs=[processing_indicator, process_btn],
     )
 
-    # Auto-navigate back to dashboard on successful intake
-    intake_success_trigger.change(
-        lambda: goto("dashboard"),
-        outputs=all_pages,
-    ).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    # Confirmation banner buttons
+    confirm_back_dashboard.click(lambda: goto("dashboard"), outputs=all_pages).then(refresh_dashboard, outputs=[dash_stats_html, dash_activity_html])
+    confirm_new_intake.click(
+        lambda: (
+            goto("intake"),
+            gr.update(visible=False),  # hide preview
+            gr.update(visible=False),  # hide confirm
+            gr.update(value=""),       # clear status
+            gr.update(value=None),     # clear audio
+            gr.update(value=""),       # clear patient id
+        ),
+        outputs=[
+            all_pages[0], all_pages[1], all_pages[2], all_pages[3], all_pages[4],
+            nurse_preview_group, confirm_group, intake_status, audio_input, patient_id_input,
+        ],
+    )
 
     # ═══════════════════════════════════════════════════════════════════════
     # DOCTOR QUEUE / REVIEW WIRING
     # ═══════════════════════════════════════════════════════════════════════
-    review_btn.click(
-        lambda: goto("review"),
-        outputs=all_pages,
-    ).then(
+    review_btn.click(lambda: goto("review"), outputs=all_pages).then(
         load_review,
         inputs=[queue_select],
         outputs=[
@@ -724,26 +775,14 @@ with gr.Blocks(css=CUSTOM_CSS, title="MediVoice — Multi-Lingual Patient Intake
 
     finalize_btn.click(
         confirm_and_finalize,
-        inputs=[
-            visit_id_state, chief_complaint_box, duration_box, severity_box,
-            history_box, recommendations_box,
-        ],
+        inputs=[visit_id_state, chief_complaint_box, duration_box, severity_box, history_box, recommendations_box],
         outputs=[review_status, queue_html, queue_select, finalize_trigger, visit_id_state],
         show_progress="minimal",
     )
 
-    # Auto-return to queue after successful finalize
-    finalize_trigger.change(
-        lambda: goto("queue"),
-        outputs=all_pages,
-    ).then(refresh_queue, outputs=[queue_html, queue_select])
-
-    export_btn.click(
-        export_csv,
-        inputs=[visit_id_state],
-        outputs=[export_file],
-    )
+    finalize_trigger.change(lambda: goto("queue"), outputs=all_pages).then(refresh_queue, outputs=[queue_html, queue_select])
+    export_btn.click(export_csv, inputs=[visit_id_state], outputs=[export_file])
 
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(share=True)
