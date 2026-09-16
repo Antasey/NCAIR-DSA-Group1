@@ -15,6 +15,7 @@ Built during the **NCAIR & NITDA Data Science and AI Residency (DSA) Programme**
 - [Tech Stack](#tech-stack)
 - [Installation & Setup](#installation--setup)
 - [Running the App](#running-the-app)
+- [MediVoice.v3 Demo](#DEMO)
 - [Team Members](#team-members)
 - [Acknowledgements](#acknowledgements)
 
