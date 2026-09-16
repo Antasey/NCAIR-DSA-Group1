@@ -198,10 +198,10 @@ Tests cover:
 
 ---
 ## DEMO
-<video controls="controls" style="max-width: 100%;">
-  <source src="https://github.com/Antasey/NCAIR-DSA-Group1/releases/download/demo/MediVoice.Multi-Lingual.Patient.Intake.Assistant.-.Brave.2026-09-16.13-30-10.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+
+[![Watch the MediVoice Demo](thumbnail.png)](https://github.com/Antasey/NCAIR-DSA-Group1/releases/download/demo/MediVoice.Multi-Lingual.Patient.Intake.Assistant.-.Brave.2026-09-16.13-30-10.mp4)
+
+*💡 Click the image above to watch the full application walkthrough.*
 
 
 ---
