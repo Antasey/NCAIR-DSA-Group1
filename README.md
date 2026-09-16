@@ -196,7 +196,11 @@ Tests cover:
 - Visit queue ordering and review workflow
 
 ---
+## DEMO
+<video src="(https://github.com/Antasey/NCAIR-DSA-Group1/releases/download/demo/MediVoice.Multi-Lingual.Patient.Intake.Assistant.-.Brave.2026-09-16.13-30-10.mp4)" controls="controls" style="max-width: 100%;">
+</video>
 
+---
 ## Team Members — Group 1
 
 | Name | Role |
